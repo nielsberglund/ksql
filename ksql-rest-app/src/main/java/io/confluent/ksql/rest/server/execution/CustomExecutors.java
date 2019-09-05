@@ -18,15 +18,20 @@ package io.confluent.ksql.rest.server.execution;
 import com.google.common.collect.ImmutableMap;
 import io.confluent.ksql.KsqlExecutionContext;
 import io.confluent.ksql.engine.InsertValuesExecutor;
+import io.confluent.ksql.parser.tree.CreateConnector;
+import io.confluent.ksql.parser.tree.DescribeConnector;
 import io.confluent.ksql.parser.tree.DescribeFunction;
+import io.confluent.ksql.parser.tree.DropConnector;
 import io.confluent.ksql.parser.tree.Explain;
 import io.confluent.ksql.parser.tree.InsertValues;
+import io.confluent.ksql.parser.tree.ListConnectors;
 import io.confluent.ksql.parser.tree.ListFunctions;
 import io.confluent.ksql.parser.tree.ListProperties;
 import io.confluent.ksql.parser.tree.ListQueries;
 import io.confluent.ksql.parser.tree.ListStreams;
 import io.confluent.ksql.parser.tree.ListTables;
 import io.confluent.ksql.parser.tree.ListTopics;
+import io.confluent.ksql.parser.tree.ListTypes;
 import io.confluent.ksql.parser.tree.SetProperty;
 import io.confluent.ksql.parser.tree.ShowColumns;
 import io.confluent.ksql.parser.tree.Statement;
@@ -55,13 +60,19 @@ public enum CustomExecutors {
   LIST_FUNCTIONS(ListFunctions.class, ListFunctionsExecutor::execute),
   LIST_QUERIES(ListQueries.class, ListQueriesExecutor::execute),
   LIST_PROPERTIES(ListProperties.class, ListPropertiesExecutor::execute),
+  LIST_CONNECTORS(ListConnectors.class, ListConnectorsExecutor::execute),
+  LIST_TYPES(ListTypes.class, ListTypesExecutor::execute),
 
   SHOW_COLUMNS(ShowColumns.class, ListSourceExecutor::columns),
   EXPLAIN(Explain.class, ExplainExecutor::execute),
   DESCRIBE_FUNCTION(DescribeFunction.class, DescribeFunctionExecutor::execute),
   SET_PROPERTY(SetProperty.class, PropertyExecutor::set),
   UNSET_PROPERTY(UnsetProperty.class, PropertyExecutor::unset),
-  INSERT_VALUES(InsertValues.class, insertValuesExecutor());
+  INSERT_VALUES(InsertValues.class, insertValuesExecutor()),
+  CREATE_CONNECTOR(CreateConnector.class, ConnectExecutor::execute),
+  DROP_CONNECTOR(DropConnector.class, DropConnectorExecutor::execute),
+  DESCRIBE_CONNECTOR(DescribeConnector.class, new DescribeConnectorExecutor()::execute)
+  ;
 
   public static final Map<Class<? extends Statement>, StatementExecutor<?>> EXECUTOR_MAP =
       ImmutableMap.copyOf(
@@ -75,9 +86,10 @@ public enum CustomExecutors {
   private final Class<? extends Statement> statementClass;
   private final StatementExecutor executor;
 
-  CustomExecutors(
-      final Class<? extends Statement> statementClass,
-      final StatementExecutor executor) {
+  <T extends Statement> CustomExecutors(
+      final Class<T> statementClass,
+      final StatementExecutor<? super T> executor
+  ) {
     this.statementClass = Objects.requireNonNull(statementClass, "statementClass");
     this.executor = Objects.requireNonNull(executor, "executor");
   }

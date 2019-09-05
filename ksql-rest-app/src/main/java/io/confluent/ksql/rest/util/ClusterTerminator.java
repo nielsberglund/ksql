@@ -24,7 +24,6 @@ import io.confluent.ksql.schema.registry.SchemaRegistryUtil;
 import io.confluent.ksql.serde.Format;
 import io.confluent.ksql.services.ServiceContext;
 import io.confluent.ksql.util.ExecutorUtil;
-import io.confluent.ksql.util.KsqlConfig;
 import io.confluent.ksql.util.KsqlConstants;
 import io.confluent.ksql.util.KsqlException;
 import io.confluent.ksql.util.QueryMetadata;
@@ -49,12 +48,10 @@ public class ClusterTerminator {
   private final List<String> managedTopics;
 
   public ClusterTerminator(
-      final KsqlConfig ksqlConfig,
       final KsqlEngine ksqlEngine,
       final ServiceContext serviceContext,
       final List<String> managedTopics
   ) {
-    Objects.requireNonNull(ksqlConfig, "ksqlConfig is null.");
     Objects.requireNonNull(ksqlEngine, "ksqlEngine is null.");
     this.ksqlEngine = ksqlEngine;
     this.serviceContext = Objects.requireNonNull(serviceContext);
@@ -148,7 +145,7 @@ public class ClusterTerminator {
 
   private static Set<String> subjectNames(final List<DataSource<?>> sources) {
     return sources.stream()
-        .filter(s -> s.getKsqlTopic().getValueSerdeFactory().getFormat() == Format.AVRO)
+        .filter(s -> s.getKsqlTopic().getValueFormat().getFormat() == Format.AVRO)
         .map(DataSource::getKsqlTopic)
         .map(KsqlTopic::getKafkaTopicName)
         .map(topicName -> topicName + KsqlConstants.SCHEMA_REGISTRY_VALUE_SUFFIX)

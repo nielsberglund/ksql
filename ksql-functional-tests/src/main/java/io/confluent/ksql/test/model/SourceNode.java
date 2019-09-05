@@ -18,11 +18,12 @@ package io.confluent.ksql.test.model;
 import static org.hamcrest.Matchers.allOf;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
+import io.confluent.ksql.execution.expression.tree.Type;
+import io.confluent.ksql.metastore.TypeRegistry;
 import io.confluent.ksql.metastore.model.DataSource;
 import io.confluent.ksql.metastore.model.KsqlStream;
 import io.confluent.ksql.metastore.model.KsqlTable;
 import io.confluent.ksql.metastore.model.MetaStoreMatchers;
-import io.confluent.ksql.parser.tree.Type;
 import io.confluent.ksql.schema.ksql.SchemaConverters;
 import io.confluent.ksql.schema.ksql.TypeContextUtil;
 import io.confluent.ksql.test.tools.exceptions.InvalidFieldException;
@@ -43,16 +44,19 @@ class SourceNode {
   private final Optional<Class<? extends DataSource>> type;
   private final Optional<KeyFieldNode> keyField;
   private final Optional<Schema> valueSchema;
+  private final Optional<KeyFormatNode> keyFormat;
 
   SourceNode(
       @JsonProperty(value = "name", required = true) final String name,
       @JsonProperty(value = "type", required = true) final String type,
       @JsonProperty("keyField") final KeyFieldNode keyField,
-      @JsonProperty("valueSchema") final String valueSchema
+      @JsonProperty("valueSchema") final String valueSchema,
+      @JsonProperty("keyFormat") final KeyFormatNode keyFormat
   ) {
     this.name = name == null ? "" : name;
     this.keyField = Optional.ofNullable(keyField);
     this.valueSchema = parseSchema(valueSchema);
+    this.keyFormat = Optional.ofNullable(keyFormat);
     this.type = Optional.ofNullable(type)
         .map(String::toUpperCase)
         .map(SourceNode::toType);
@@ -85,8 +89,13 @@ class SourceNode {
         .map(MetaStoreMatchers::hasValueSchema)
         .orElse(null);
 
+    final Matcher<DataSource<?>> keyFormatMatcher = keyFormat
+        .map(KeyFormatNode::build)
+        .map(MetaStoreMatchers::hasKeyFormat)
+        .orElse(null);
+
     final Matcher<DataSource<?>>[] matchers = Stream
-        .of(nameMatcher, typeMatcher, keyFieldMatcher, valueSchemaMatcher)
+        .of(nameMatcher, typeMatcher, keyFieldMatcher, valueSchemaMatcher, keyFormatMatcher)
         .filter(Objects::nonNull)
         .toArray(Matcher[]::new);
 
@@ -108,7 +117,7 @@ class SourceNode {
 
   private static Optional<Schema> parseSchema(final String schema) {
     return Optional.ofNullable(schema)
-        .map(TypeContextUtil::getType)
+        .map(schemaString -> TypeContextUtil.getType(schemaString, TypeRegistry.EMPTY))
         .map(Type::getSqlType)
         .map(SchemaConverters.sqlToConnectConverter()::toConnectSchema)
         .map(SourceNode::makeTopLevelStructNoneOptional);

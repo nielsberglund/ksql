@@ -18,15 +18,20 @@ package io.confluent.ksql.rest.server.validation;
 import com.google.common.collect.ImmutableMap;
 import io.confluent.ksql.KsqlExecutionContext;
 import io.confluent.ksql.engine.InsertValuesExecutor;
+import io.confluent.ksql.parser.tree.CreateConnector;
+import io.confluent.ksql.parser.tree.DescribeConnector;
 import io.confluent.ksql.parser.tree.DescribeFunction;
+import io.confluent.ksql.parser.tree.DropConnector;
 import io.confluent.ksql.parser.tree.Explain;
 import io.confluent.ksql.parser.tree.InsertValues;
+import io.confluent.ksql.parser.tree.ListConnectors;
 import io.confluent.ksql.parser.tree.ListFunctions;
 import io.confluent.ksql.parser.tree.ListProperties;
 import io.confluent.ksql.parser.tree.ListQueries;
 import io.confluent.ksql.parser.tree.ListStreams;
 import io.confluent.ksql.parser.tree.ListTables;
 import io.confluent.ksql.parser.tree.ListTopics;
+import io.confluent.ksql.parser.tree.ListTypes;
 import io.confluent.ksql.parser.tree.PrintTopic;
 import io.confluent.ksql.parser.tree.Query;
 import io.confluent.ksql.parser.tree.SetProperty;
@@ -34,6 +39,7 @@ import io.confluent.ksql.parser.tree.ShowColumns;
 import io.confluent.ksql.parser.tree.Statement;
 import io.confluent.ksql.parser.tree.TerminateQuery;
 import io.confluent.ksql.parser.tree.UnsetProperty;
+import io.confluent.ksql.rest.server.execution.DescribeConnectorExecutor;
 import io.confluent.ksql.rest.server.execution.DescribeFunctionExecutor;
 import io.confluent.ksql.rest.server.execution.ExplainExecutor;
 import io.confluent.ksql.rest.server.execution.ListSourceExecutor;
@@ -64,11 +70,16 @@ public enum CustomValidators {
   LIST_FUNCTIONS(ListFunctions.class, StatementValidator.NO_VALIDATION),
   LIST_QUERIES(ListQueries.class, StatementValidator.NO_VALIDATION),
   LIST_PROPERTIES(ListProperties.class, StatementValidator.NO_VALIDATION),
-  INSERT_VALUES(InsertValues.class, new InsertValuesExecutor()::execute),
+  LIST_CONNECTORS(ListConnectors.class, StatementValidator.NO_VALIDATION),
+  LIST_TYPES(ListTypes.class, StatementValidator.NO_VALIDATION),
+  CREATE_CONNECTOR(CreateConnector.class, StatementValidator.NO_VALIDATION),
+  DROP_CONNECTOR(DropConnector.class, StatementValidator.NO_VALIDATION),
 
+  INSERT_VALUES(InsertValues.class, new InsertValuesExecutor()::execute),
   SHOW_COLUMNS(ShowColumns.class, ListSourceExecutor::columns),
   EXPLAIN(Explain.class, ExplainExecutor::execute),
   DESCRIBE_FUNCTION(DescribeFunction.class, DescribeFunctionExecutor::execute),
+  DESCRIBE_CONNECTOR(DescribeConnector.class, new DescribeConnectorExecutor()::execute),
   SET_PROPERTY(SetProperty.class, PropertyExecutor::set),
   UNSET_PROPERTY(UnsetProperty.class, PropertyExecutor::unset),
 
@@ -86,9 +97,10 @@ public enum CustomValidators {
   private final Class<? extends Statement> statementClass;
   private final StatementValidator validator;
 
-  CustomValidators(
-      final Class<? extends Statement> statementClass,
-      final StatementValidator validator) {
+  <T extends Statement> CustomValidators(
+      final Class<T> statementClass,
+      final StatementValidator<? super T> validator
+  ) {
     this.statementClass = Objects.requireNonNull(statementClass, "statementClass");
     this.validator = Objects.requireNonNull(validator, "validator");
   }

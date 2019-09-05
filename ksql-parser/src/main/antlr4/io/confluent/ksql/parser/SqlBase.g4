@@ -32,14 +32,17 @@ singleExpression
     ;
 
 statement
-    : query                                                                 #querystatement
+    : query                                                                 #queryStatement
     | (LIST | SHOW) PROPERTIES                                              #listProperties
-    | (LIST | SHOW) TOPICS                                                  #listTopics
+    | (LIST | SHOW) TOPICS EXTENDED?                                        #listTopics
     | (LIST | SHOW) STREAMS EXTENDED?                                       #listStreams
     | (LIST | SHOW) TABLES EXTENDED?                                        #listTables
     | (LIST | SHOW) FUNCTIONS                                               #listFunctions
+    | (LIST | SHOW) (SOURCE | SINK)? CONNECTORS                             #listConnectors
+    | (LIST | SHOW) TYPES                                                   #listTypes
     | DESCRIBE EXTENDED? qualifiedName                                      #showColumns
     | DESCRIBE FUNCTION qualifiedName                                       #describeFunction
+    | DESCRIBE CONNECTOR identifier                                         #describeConnector
     | PRINT (qualifiedName | STRING) printClause                            #printTopic
     | (LIST | SHOW) QUERIES EXTENDED?                                       #listQueries
     | TERMINATE QUERY? qualifiedName                                        #terminateQuery
@@ -56,12 +59,16 @@ statement
                     (WITH tableProperties)?                                 #createTable
     | CREATE TABLE (IF NOT EXISTS)? qualifiedName
             (WITH tableProperties)? AS query                                #createTableAs
+    | CREATE (SINK | SOURCE) CONNECTOR identifier WITH tableProperties      #createConnector
     | INSERT INTO qualifiedName query (PARTITION BY identifier)?            #insertInto
     | INSERT INTO qualifiedName (columns)? VALUES values                    #insertValues
     | DROP STREAM (IF EXISTS)? qualifiedName (DELETE TOPIC)?                #dropStream
     | DROP TABLE (IF EXISTS)? qualifiedName  (DELETE TOPIC)?                #dropTable
+    | DROP CONNECTOR identifier                                             #dropConnector
     | EXPLAIN  (statement | qualifiedName)                                  #explain
     | RUN SCRIPT STRING                                                     #runScript
+    | CREATE TYPE identifier AS type                                        #registerType
+    | DROP TYPE identifier                                                  #dropType
     ;
 
 query
@@ -87,7 +94,7 @@ tableProperties
     ;
 
 tableProperty
-    : identifier EQ literal
+    : (identifier | STRING) EQ literal
     ;
 
 printClause
@@ -313,9 +320,10 @@ nonReserved
     | STRUCT | MAP | ARRAY | PARTITION
     | INTEGER | DATE | TIME | TIMESTAMP | INTERVAL | ZONE
     | YEAR | MONTH | DAY | HOUR | MINUTE | SECOND
-    | EXPLAIN | ANALYZE | TYPE
+    | EXPLAIN | ANALYZE | TYPE | TYPES
     | SET | RESET
     | IF
+    | SOURCE | SINK
     | KEY
     ;
 
@@ -396,6 +404,7 @@ PRINT: 'PRINT';
 EXPLAIN: 'EXPLAIN';
 ANALYZE: 'ANALYZE';
 TYPE: 'TYPE';
+TYPES: 'TYPES';
 CAST: 'CAST';
 SHOW: 'SHOW';
 LIST: 'LIST';
@@ -428,6 +437,10 @@ RUN: 'RUN';
 SCRIPT: 'SCRIPT';
 DECIMAL: 'DECIMAL';
 KEY: 'KEY';
+CONNECTOR: 'CONNECTOR';
+CONNECTORS: 'CONNECTORS';
+SINK: 'SINK';
+SOURCE: 'SOURCE';
 
 IF: 'IF';
 

@@ -23,10 +23,14 @@ import io.confluent.ksql.function.udf.Udf;
 import io.confluent.ksql.function.udf.UdfDescription;
 import io.confluent.ksql.function.udf.UdfMetadata;
 import io.confluent.ksql.function.udf.UdfParameter;
+import io.confluent.ksql.function.udf.UdfSchemaProvider;
+import io.confluent.ksql.metastore.TypeRegistry;
 import io.confluent.ksql.metrics.MetricCollectors;
 import io.confluent.ksql.schema.ksql.SchemaConverters;
 import io.confluent.ksql.schema.ksql.TypeContextUtil;
+import io.confluent.ksql.schema.ksql.types.SqlType;
 import io.confluent.ksql.security.ExtensionSecurityManager;
+import io.confluent.ksql.util.DecimalUtil;
 import io.confluent.ksql.util.KsqlConfig;
 import io.confluent.ksql.util.KsqlException;
 import io.confluent.ksql.util.SchemaUtil;
@@ -35,6 +39,7 @@ import io.github.lukehutch.fastclasspathscanner.matchprocessor.ClassAnnotationMa
 import io.github.lukehutch.fastclasspathscanner.matchprocessor.MethodAnnotationMatchProcessor;
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Parameter;
@@ -46,6 +51,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -53,9 +59,9 @@ import org.apache.kafka.common.Configurable;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.metrics.Sensor;
 import org.apache.kafka.common.metrics.stats.Avg;
-import org.apache.kafka.common.metrics.stats.Count;
 import org.apache.kafka.common.metrics.stats.Max;
 import org.apache.kafka.common.metrics.stats.Rate;
+import org.apache.kafka.common.metrics.stats.WindowedCount;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.connect.data.Schema;
 import org.slf4j.Logger;
@@ -118,6 +124,27 @@ public class UdfLoader {
     }
   }
 
+  // Does not handle customer udfs, i.e the loader is the ParentClassLoader and path is internal
+  public void loadUdfFromClass(final Class<?> ... udfClass) {
+    for (final Class<?> theClass: udfClass) {
+      //classes must be annotated with @UdfDescription
+      final UdfDescription udfDescription = theClass.getAnnotation(UdfDescription.class);
+      if (udfDescription == null) {
+        throw new KsqlException(String.format("Cannot load class %s. Classes containing UDFs must"
+            + "be annotated with @UdfDescription.", theClass.getName()));
+      }
+      //method must be public and annotated with @Udf
+      for (Method m: theClass.getDeclaredMethods()) {
+        if (m.isAnnotationPresent(Udf.class) && Modifier.isPublic(m.getModifiers())) {
+          handleUdfAnnotation(theClass,
+                              udfDescription,
+                              m,
+                              parentClassLoader,
+                              KsqlFunction.INTERNAL_PATH) ;
+        }
+      }
+    }
+  }
 
   @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
   private void loadUdfs(final ClassLoader loader, final Optional<Path> path) {
@@ -138,7 +165,8 @@ public class UdfLoader {
               }
               return name.contains("ksql-engine");
             })
-        .matchClassesWithMethodAnnotation(Udf.class, handleUdfAnnotation(loader, pathLoadedFrom))
+        .matchClassesWithMethodAnnotation(Udf.class,
+                                          processMethodAnnotation(loader, pathLoadedFrom))
         .matchClassesWithAnnotation(UdafDescription.class,
             handleUdafAnnotation(loader, pathLoadedFrom))
         .scan();
@@ -201,8 +229,8 @@ public class UdfLoader {
     };
   }
 
-  private MethodAnnotationMatchProcessor handleUdfAnnotation(final ClassLoader loader,
-                                                             final String path) {
+  private MethodAnnotationMatchProcessor processMethodAnnotation(final ClassLoader loader,
+                                                                 final String path) {
     return (theClass, executable) ->  {
       final UdfDescription annotation = theClass.getAnnotation(UdfDescription.class);
       if (annotation == null) {
@@ -214,8 +242,7 @@ public class UdfLoader {
       LOGGER.info("Adding UDF name='{}' from path={}", annotation.name(), path);
       final Method method = (Method) executable;
       try {
-        final UdfInvoker udf = UdfCompiler.compile(method, loader);
-        addFunction(annotation, method, udf, path);
+        handleUdfAnnotation(theClass, annotation, method, loader, path);
       } catch (final KsqlException e) {
         if (parentClassLoader == loader) {
           throw e;
@@ -229,7 +256,20 @@ public class UdfLoader {
     };
   }
 
-  private void addFunction(final UdfDescription classLevelAnnotation,
+  private void handleUdfAnnotation(final Class<?> theClass,
+                                   final UdfDescription annotation,
+                                   final Method method,
+                                   final ClassLoader classLoader,
+                                   final String path) {
+
+    LOGGER.info("Adding UDF name='{}' from class={}", annotation.name(), theClass);
+    final UdfInvoker udf = UdfCompiler.compile(method, classLoader);
+    addFunction(theClass, annotation, method, udf, path);
+  }
+
+
+  private void addFunction(final Class theClass,
+                           final UdfDescription classLevelAnnotation,
                            final Method method,
                            final UdfInvoker udf,
                            final String path) {
@@ -268,9 +308,9 @@ public class UdfLoader {
 
       if (name.trim().isEmpty()) {
         throw new KsqlFunctionException(
-            String.format("Cannot resolve parameter name for param at index %d for udf %s:%s. "
-                + "Please specify a name in @UdfParameter or compile your JAR with -parameters "
-                + "to infer the name from the parameter name.",
+            String.format("Cannot resolve parameter name for param at index %d for UDF %s:%s. "
+                    + "Please specify a name in @UdfParameter or compile your JAR with -parameters "
+                    + "to infer the name from the parameter name.",
                 idx, classLevelAnnotation.name(), method.getName()));
       }
 
@@ -278,7 +318,7 @@ public class UdfLoader {
       if (annotation.isPresent() && !annotation.get().schema().isEmpty()) {
         return SchemaConverters.sqlToConnectConverter()
             .toConnectSchema(
-                TypeContextUtil.getType(annotation.get().schema()).getSqlType(),
+                TypeContextUtil.getType(annotation.get().schema(), TypeRegistry.EMPTY).getSqlType(),
                 name,
                 doc);
       }
@@ -286,10 +326,15 @@ public class UdfLoader {
       return UdfUtil.getSchemaFromType(type, name, doc);
     }).collect(Collectors.toList());
 
-    final Schema returnType = getReturnType(method, udfAnnotation);
+    final Schema javaReturnSchema = getReturnType(method, udfAnnotation);
 
     functionRegistry.addFunction(KsqlFunction.create(
-        returnType,
+        handleUdfReturnSchema(theClass,
+                              method,
+                              javaReturnSchema,
+                              udfAnnotation,
+                              classLevelAnnotation),
+        javaReturnSchema,
         parameters,
         functionName,
         udfClass,
@@ -308,8 +353,9 @@ public class UdfLoader {
         method.isVarArgs()));
   }
 
+
   private static Object instantiateUdfClass(final Method method,
-                                     final UdfDescription annotation) {
+                                            final UdfDescription annotation) {
     try {
       return method.getDeclaringClass().newInstance();
     } catch (final Exception e) {
@@ -317,6 +363,85 @@ public class UdfLoader {
           + annotation.name()
           + ", method=" + method,
           e);
+    }
+  }
+
+  private static Object instantiateUdfClass(final Class udfClass,
+                                            final UdfDescription annotation) {
+    try {
+      return udfClass.newInstance();
+    } catch (final Exception e) {
+      throw new KsqlException("Failed to create instance for UDF="
+          + annotation.name(), e);
+    }
+  }
+
+  private Function<List<Schema>,Schema> handleUdfReturnSchema(final Class theClass,
+                                                              final Method method,
+                                                              final Schema javaReturnSchema,
+                                                              final Udf udfAnnotation,
+                                                              final UdfDescription descAnnotation) {
+
+    final String schemaProviderName = udfAnnotation.schemaProvider();
+
+    if (!schemaProviderName.equals("")) {
+      return handleUdfSchemaProviderAnnotation(schemaProviderName, theClass, method,
+          descAnnotation);
+    } else if (DecimalUtil.isDecimal(javaReturnSchema)) {
+      throw new KsqlException(String.format("Cannot load UDF %s. BigDecimal return type "
+          + "is not supported without a schema provider method.", descAnnotation.name()));
+    }
+
+    return ignored -> javaReturnSchema;
+  }
+
+  private Function<List<Schema>,Schema> handleUdfSchemaProviderAnnotation(
+      final String schemaProviderName,
+      final Class theClass,
+      final Method method,
+      final UdfDescription annotation) {
+
+    // throws exception if cannot find method
+    final Method m = findSchemaProvider(theClass, schemaProviderName);
+    final Object instance = instantiateUdfClass(theClass, annotation);
+
+    return parameterSchemas -> {
+      final List<SqlType> parameterTypes = parameterSchemas.stream()
+          .map(p -> SchemaConverters.connectToSqlConverter().toSqlType(p))
+          .collect(Collectors.toList());
+      return SchemaConverters.sqlToConnectConverter().toConnectSchema(invokeSchemaProviderMethod(
+          instance, m, parameterTypes, annotation));
+    };
+  }
+
+  private Method findSchemaProvider(final Class<?> theClass,
+                                    final String schemaProviderName) {
+    try {
+      final Method m = theClass.getDeclaredMethod(schemaProviderName, List.class);
+      if (!m.isAnnotationPresent(UdfSchemaProvider.class)) {
+        throw new KsqlException(String.format(
+            "Method %s should be annotated with @UdfSchemaProvider.",
+            schemaProviderName));
+      }
+      return m;
+    } catch (NoSuchMethodException e) {
+      throw new KsqlException(String.format(
+          "Cannot find schema provider method with name %s and parameter List<SqlType> in class "
+              + "%s.", schemaProviderName,theClass.getName()),e);
+    }
+  }
+
+  private SqlType invokeSchemaProviderMethod(final Object instance,
+                                            final Method m,
+                                            final List<SqlType> args,
+                                            final UdfDescription annotation) {
+    try {
+      return (SqlType) m.invoke(instance, args);
+    } catch (IllegalAccessException
+        | InvocationTargetException e) {
+      throw new KsqlException(String.format("Cannot invoke the schema provider "
+              + "method %s for UDF %s. ",
+          m.getName(), annotation.name()), e);
     }
   }
 
@@ -332,19 +457,18 @@ public class UdfLoader {
             new Max());
         sensor.add(metrics.metricName(sensorName + "-count", UDF_METRIC_GROUP,
             "Total number of invocations of " + udfName + " udf"),
-            new Count());
+            new WindowedCount());
         sensor.add(metrics.metricName(sensorName + "-rate", UDF_METRIC_GROUP,
             "The average number of occurrence of " + udfName + " operation per second "
                 + udfName + " udf"),
-            new Rate(TimeUnit.SECONDS, new Count()));
+            new Rate(TimeUnit.SECONDS, new WindowedCount()));
       }
     });
   }
 
   public static UdfLoader newInstance(final KsqlConfig config,
                                       final MutableFunctionRegistry metaStore,
-                                      final String ksqlInstallDir
-  ) {
+                                      final String ksqlInstallDir) {
     final Boolean loadCustomerUdfs = config.getBoolean(KsqlConfig.KSQL_ENABLE_UDFS);
     final Boolean collectMetrics = config.getBoolean(KsqlConfig.KSQL_COLLECT_UDF_METRICS);
     final String extDirName = config.getString(KsqlConfig.KSQL_EXT_DIR);
@@ -375,7 +499,8 @@ public class UdfLoader {
           ? UdfUtil.getSchemaFromType(method.getGenericReturnType())
           : SchemaConverters
               .sqlToConnectConverter()
-              .toConnectSchema(TypeContextUtil.getType(udfAnnotation.schema()).getSqlType());
+              .toConnectSchema(
+                  TypeContextUtil.getType(udfAnnotation.schema(), TypeRegistry.EMPTY).getSqlType());
 
       return SchemaUtil.ensureOptional(returnType);
     } catch (final KsqlException e) {

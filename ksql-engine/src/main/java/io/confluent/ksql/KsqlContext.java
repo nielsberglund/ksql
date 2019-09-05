@@ -31,8 +31,8 @@ import io.confluent.ksql.parser.tree.Statement;
 import io.confluent.ksql.parser.tree.UnsetProperty;
 import io.confluent.ksql.properties.PropertyOverrider;
 import io.confluent.ksql.query.QueryId;
-import io.confluent.ksql.services.DefaultServiceContext;
 import io.confluent.ksql.services.ServiceContext;
+import io.confluent.ksql.services.ServiceContextFactory;
 import io.confluent.ksql.statement.ConfiguredStatement;
 import io.confluent.ksql.statement.Injector;
 import io.confluent.ksql.statement.Injectors;
@@ -53,7 +53,7 @@ import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class KsqlContext {
+public class KsqlContext implements AutoCloseable {
 
   private static final Logger LOG = LoggerFactory.getLogger(KsqlContext.class);
 
@@ -71,7 +71,7 @@ public class KsqlContext {
       final ProcessingLogContext processingLogContext
   ) {
     Objects.requireNonNull(ksqlConfig, "ksqlConfig cannot be null.");
-    final ServiceContext serviceContext = DefaultServiceContext.create(ksqlConfig);
+    final ServiceContext serviceContext = ServiceContextFactory.create(ksqlConfig);
     final MutableFunctionRegistry functionRegistry = new InternalFunctionRegistry();
     UdfLoader.newInstance(ksqlConfig, functionRegistry, ".").load();
     final ServiceInfo serviceInfo = ServiceInfo.create(ksqlConfig);
@@ -171,7 +171,7 @@ public class KsqlContext {
     ksqlEngine.getPersistentQuery(queryId).ifPresent(QueryMetadata::close);
   }
 
-  private ExecuteResult execute(
+  private static ExecuteResult execute(
       final KsqlExecutionContext executionContext,
       final ParsedStatement stmt,
       final KsqlConfig ksqlConfig,

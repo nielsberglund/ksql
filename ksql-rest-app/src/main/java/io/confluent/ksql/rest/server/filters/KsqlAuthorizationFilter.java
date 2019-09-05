@@ -16,7 +16,7 @@
 package io.confluent.ksql.rest.server.filters;
 
 import io.confluent.ksql.rest.server.resources.Errors;
-import io.confluent.ksql.rest.server.security.KsqlAuthorizationProvider;
+import io.confluent.ksql.security.KsqlAuthorizationProvider;
 import java.security.Principal;
 import javax.annotation.Priority;
 import javax.ws.rs.Priorities;
@@ -47,7 +47,8 @@ public class KsqlAuthorizationFilter implements ContainerRequestFilter  {
     try {
       authorizationProvider.checkEndpointAccess(user, method, path);
     } catch (final Throwable t) {
-      log.warn(String.format("User:%s is denied access to \"%s %s\"", user, method, path), t);
+      log.warn(String.format("User:%s is denied access to \"%s %s\"",
+          user.getName(), method, path), t);
       requestContext.abortWith(Errors.accessDenied(t.getMessage()));
     }
   }

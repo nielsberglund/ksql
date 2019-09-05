@@ -15,6 +15,7 @@
 
 package io.confluent.ksql.structured;
 
+import static java.util.Collections.emptyMap;
 import static org.easymock.EasyMock.anyObject;
 import static org.easymock.EasyMock.eq;
 import static org.easymock.EasyMock.expect;
@@ -24,31 +25,38 @@ import static org.easymock.EasyMock.same;
 import static org.easymock.EasyMock.verify;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.instanceOf;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.is;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.when;
 
+import com.google.common.collect.ImmutableMap;
 import io.confluent.kafka.schemaregistry.client.MockSchemaRegistryClient;
 import io.confluent.ksql.GenericRow;
+import io.confluent.ksql.execution.context.QueryContext;
+import io.confluent.ksql.execution.expression.tree.DereferenceExpression;
+import io.confluent.ksql.execution.expression.tree.Expression;
+import io.confluent.ksql.execution.expression.tree.QualifiedName;
+import io.confluent.ksql.execution.expression.tree.QualifiedNameReference;
 import io.confluent.ksql.function.InternalFunctionRegistry;
 import io.confluent.ksql.function.KsqlAggregateFunction;
 import io.confluent.ksql.function.udaf.KudafInitializer;
+import io.confluent.ksql.logging.processing.NoopProcessingLogContext;
 import io.confluent.ksql.logging.processing.ProcessingLogContext;
 import io.confluent.ksql.metastore.MetaStore;
 import io.confluent.ksql.metastore.model.KeyField;
 import io.confluent.ksql.metastore.model.KsqlTable;
-import io.confluent.ksql.parser.tree.DereferenceExpression;
-import io.confluent.ksql.parser.tree.Expression;
-import io.confluent.ksql.parser.tree.QualifiedName;
-import io.confluent.ksql.parser.tree.QualifiedNameReference;
-import io.confluent.ksql.parser.tree.TumblingWindowExpression;
 import io.confluent.ksql.parser.tree.WindowExpression;
 import io.confluent.ksql.planner.plan.PlanNode;
 import io.confluent.ksql.query.QueryId;
+import io.confluent.ksql.schema.ksql.Field;
 import io.confluent.ksql.schema.ksql.LogicalSchema;
 import io.confluent.ksql.schema.ksql.PersistenceSchema;
-import io.confluent.ksql.schema.ksql.PhysicalSchema;
+import io.confluent.ksql.schema.ksql.types.SqlTypes;
+import io.confluent.ksql.serde.Format;
+import io.confluent.ksql.serde.FormatInfo;
 import io.confluent.ksql.serde.GenericRowSerDe;
-import io.confluent.ksql.serde.KsqlSerdeFactory;
-import io.confluent.ksql.serde.SerdeOption;
-import io.confluent.ksql.serde.json.KsqlJsonSerdeFactory;
+import io.confluent.ksql.serde.KeySerde;
 import io.confluent.ksql.streams.MaterializedFactory;
 import io.confluent.ksql.streams.StreamsUtil;
 import io.confluent.ksql.testutils.AnalysisTestUtil;
@@ -61,22 +69,31 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
+import java.util.Optional;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.kstream.Consumed;
+import org.apache.kafka.streams.kstream.Initializer;
 import org.apache.kafka.streams.kstream.KGroupedTable;
 import org.apache.kafka.streams.kstream.KTable;
 import org.apache.kafka.streams.kstream.Materialized;
 import org.junit.Assert;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.ExpectedException;
+import org.junit.runner.RunWith;
+import org.mockito.Mock;
+import org.mockito.junit.MockitoJUnitRunner;
 
 @SuppressWarnings("unchecked")
+@RunWith(MockitoJUnitRunner.class)
 public class SchemaKGroupedTableTest {
   private final KsqlConfig ksqlConfig = new KsqlConfig(Collections.emptyMap());
   private final InternalFunctionRegistry functionRegistry = new InternalFunctionRegistry();
@@ -91,6 +108,22 @@ public class SchemaKGroupedTableTest {
   private final QueryContext.Stacker queryContext
       = new QueryContext.Stacker(new QueryId("query")).push("node");
 
+  @Rule
+  public final ExpectedException expectedException = ExpectedException.none();
+
+  @Mock
+  private KeySerde<Struct> keySerde;
+  @Mock
+  private LogicalSchema aggregateSchema;
+  @Mock
+  private Initializer initializer;
+  @Mock
+  private Serde<GenericRow> topicValueSerDe;
+  @Mock
+  private Field field;
+  @Mock
+  private KsqlAggregateFunction otherFunc;
+
   private KTable kTable;
   private KsqlTable<?> ksqlTable;
 
@@ -98,43 +131,58 @@ public class SchemaKGroupedTableTest {
   public void init() {
     ksqlTable = (KsqlTable) metaStore.getSource("TEST2");
     final StreamsBuilder builder = new StreamsBuilder();
-    kTable = builder
-        .table(ksqlTable.getKsqlTopic().getKafkaTopicName(), Consumed.with(Serdes.String()
-            , ksqlTable.getKsqlTopic().getValueSerdeFactory().createSerde(
-                PersistenceSchema.of(ksqlTable.getSchema().valueSchema()),
-                new KsqlConfig(Collections.emptyMap()),
-                MockSchemaRegistryClient::new
-            )));
 
+    final Serde<GenericRow> rowSerde = GenericRowSerDe.from(
+        ksqlTable.getKsqlTopic().getValueFormat().getFormatInfo(),
+        PersistenceSchema.from(ksqlTable.getSchema().valueSchema(), false),
+        new KsqlConfig(Collections.emptyMap()),
+        MockSchemaRegistryClient::new,
+        "",
+        NoopProcessingLogContext.INSTANCE
+    );
+
+    kTable = builder.table(
+        ksqlTable.getKsqlTopic().getKafkaTopicName(),
+        Consumed.with(Serdes.String(), rowSerde)
+    );
+
+    when(aggregateSchema.findValueField("GROUPING_COLUMN"))
+        .thenReturn(Optional.of(Field.of("GROUPING_COLUMN", SqlTypes.STRING)));
   }
 
   private SchemaKGroupedTable buildSchemaKGroupedTableFromQuery(
       final String query,
       final String...groupByColumns
   ) {
-    final PlanNode logicalPlan = AnalysisTestUtil.buildLogicalPlan(query, metaStore);
+    when(keySerde.rebind(any(PersistenceSchema.class))).thenReturn(keySerde);
+
+    final PlanNode logicalPlan = AnalysisTestUtil.buildLogicalPlan(ksqlConfig, query, metaStore);
+
     final SchemaKTable<?> initialSchemaKTable = new SchemaKTable<>(
-        logicalPlan.getTheSourceNode().getSchema(),
         kTable,
+        logicalPlan.getTheSourceNode().getSchema(),
+        keySerde,
         logicalPlan.getTheSourceNode().getKeyField(),
         new ArrayList<>(),
-        Serdes::String,
         SchemaKStream.Type.SOURCE,
         ksqlConfig,
         functionRegistry,
         queryContext.getQueryContext());
+
     final List<Expression> groupByExpressions =
         Arrays.stream(groupByColumns)
             .map(c -> new DereferenceExpression(new QualifiedNameReference(QualifiedName.of("TEST1")), c))
             .collect(Collectors.toList());
-    final KsqlSerdeFactory ksqlSerdeFactory = new KsqlJsonSerdeFactory();
+
     final Serde<GenericRow> rowSerde = GenericRowSerDe.from(
-        ksqlSerdeFactory,
-        PhysicalSchema.from(initialSchemaKTable.getSchema().withoutAlias(), SerdeOption.none()),
+        FormatInfo.of(Format.JSON, Optional.empty()),
+        PersistenceSchema.from(initialSchemaKTable.getSchema().withoutAlias().valueSchema(), false),
         null,
         () -> null,
         "test",
-        processingLogContext);
+        processingLogContext
+    );
+
     final SchemaKGroupedStream groupedSchemaKTable = initialSchemaKTable.groupBy(
         rowSerde, groupByExpressions, queryContext);
     Assert.assertThat(groupedSchemaKTable, instanceOf(SchemaKGroupedTable.class));
@@ -143,32 +191,26 @@ public class SchemaKGroupedTableTest {
 
   @Test
   public void shouldFailWindowedTableAggregation() {
-    final SchemaKGroupedTable kGroupedTable = buildSchemaKGroupedTableFromQuery(
-        "SELECT col0, col1, col2 FROM test1;", "COL1", "COL2");
-    final InternalFunctionRegistry functionRegistry = new InternalFunctionRegistry();
-    final WindowExpression windowExpression = new WindowExpression(
-        "window", new TumblingWindowExpression(30, TimeUnit.SECONDS));
-    try {
-      kGroupedTable.aggregate(
-          new KudafInitializer(1),
-          Collections.singletonMap(
-              0,
-              functionRegistry.getAggregate("SUM", Schema.OPTIONAL_INT64_SCHEMA)),
-          Collections.singletonMap(0, 0),
-          windowExpression,
-          GenericRowSerDe.from(
-              new KsqlJsonSerdeFactory(),
-              PhysicalSchema.from(ksqlTable.getSchema(), SerdeOption.none()),
-              ksqlConfig,
-              () -> null,
-              "test",
-              processingLogContext),
-          queryContext
-      );
-      Assert.fail("Should fail to build topology for aggregation with window");
-    } catch(final KsqlException e) {
-      Assert.assertThat(e.getMessage(), equalTo("Windowing not supported for table aggregations."));
-    }
+    // Given:
+    final WindowExpression windowExp = mock(WindowExpression.class);
+
+    final SchemaKGroupedTable groupedTable =
+        buildSchemaKGroupedTable(mockKGroupedTable, materializedFactory);
+
+    // Then:
+    expectedException.expect(KsqlException.class);
+    expectedException.expectMessage("Windowing not supported for table aggregations.");
+
+    // When:
+    groupedTable.aggregate(
+        aggregateSchema,
+        initializer,
+        0,
+        emptyMap(),
+        windowExp,
+        topicValueSerDe,
+        queryContext
+    );
   }
 
   @Test
@@ -182,14 +224,18 @@ public class SchemaKGroupedTableTest {
           0, functionRegistry.getAggregate("MAX", Schema.OPTIONAL_INT64_SCHEMA));
       aggValToFunctionMap.put(
           1, functionRegistry.getAggregate("MIN", Schema.OPTIONAL_INT64_SCHEMA));
+
+      givenAggregateSchemaFieldCount(aggValToFunctionMap.size() + 1);
+
       kGroupedTable.aggregate(
+          aggregateSchema,
           new KudafInitializer(1),
+          1,
           aggValToFunctionMap,
-          Collections.singletonMap(0, 0),
           null,
           GenericRowSerDe.from(
-              new KsqlJsonSerdeFactory(),
-              PhysicalSchema.from(ksqlTable.getSchema(), SerdeOption.none()),
+              FormatInfo.of(Format.JSON, Optional.empty()),
+              PersistenceSchema.from(ksqlTable.getSchema().valueSchema(), false),
               ksqlConfig,
               () -> null,
               "test",
@@ -207,10 +253,12 @@ public class SchemaKGroupedTableTest {
 
   private SchemaKGroupedTable buildSchemaKGroupedTable(
       final KGroupedTable kGroupedTable,
-      final MaterializedFactory materializedFactory) {
+      final MaterializedFactory materializedFactory
+  ) {
     return new SchemaKGroupedTable(
-        schema,
         kGroupedTable,
+        schema,
+        keySerde,
         KeyField.of(schema.valueFields().get(0).name(), schema.valueFields().get(0)),
         Collections.emptyList(),
         ksqlConfig,
@@ -246,8 +294,9 @@ public class SchemaKGroupedTableTest {
 
     // When:
     groupedTable.aggregate(
+        aggregateSchema,
         () -> null,
-        Collections.emptyMap(),
+        0,
         Collections.emptyMap(),
         null,
         valueSerde,
@@ -255,5 +304,59 @@ public class SchemaKGroupedTableTest {
 
     // Then:
     verify(materializedFactory, mockKGroupedTable);
+  }
+
+  @Test
+  public void shouldReturnKTableWithAggregateSchema() {
+    // Given:
+    final SchemaKGroupedTable groupedTable =
+        buildSchemaKGroupedTable(mockKGroupedTable, materializedFactory);
+
+    // When:
+    final SchemaKTable result = groupedTable.aggregate(
+        aggregateSchema,
+        initializer,
+        0,
+        emptyMap(),
+        null,
+        topicValueSerDe,
+        queryContext
+    );
+
+    // Then:
+    assertThat(result.getSchema(), is(aggregateSchema));
+  }
+
+  @Test(expected = IllegalArgumentException.class)
+  public void shouldThrowOnColumnCountMismatch() {
+    // Given:
+    final SchemaKGroupedTable groupedTable =
+        buildSchemaKGroupedTable(mockKGroupedTable, materializedFactory);
+
+    // Agg schema has 2 fields:
+    givenAggregateSchemaFieldCount(2);
+
+    // Where as params have 1 nonAgg and 2 agg fields:
+    final Map<Integer, KsqlAggregateFunction> aggColumns = ImmutableMap.of(2, otherFunc);
+
+    // When:
+    groupedTable.aggregate(
+        aggregateSchema,
+        initializer,
+        2,
+        aggColumns,
+        null,
+        topicValueSerDe,
+        queryContext
+    );
+  }
+
+  private void givenAggregateSchemaFieldCount(final int count) {
+    final List<Field> valueFields = IntStream
+        .range(0, count)
+        .mapToObj(i -> field)
+        .collect(Collectors.toList());
+
+    when(aggregateSchema.valueFields()).thenReturn(valueFields);
   }
 }

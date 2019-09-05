@@ -35,7 +35,6 @@ import com.google.common.collect.ImmutableMap.Builder;
 import com.google.common.util.concurrent.ListeningScheduledExecutorService;
 import io.confluent.kafka.schemaregistry.client.SchemaRegistryClient;
 import io.confluent.ksql.engine.KsqlEngine;
-import io.confluent.ksql.engine.TopicAccessValidator;
 import io.confluent.ksql.json.JsonMapper;
 import io.confluent.ksql.parser.KsqlParser.PreparedStatement;
 import io.confluent.ksql.parser.tree.Query;
@@ -47,14 +46,15 @@ import io.confluent.ksql.rest.entity.KsqlRequest;
 import io.confluent.ksql.rest.entity.Versions;
 import io.confluent.ksql.rest.server.StatementParser;
 import io.confluent.ksql.rest.server.computation.CommandQueue;
-import io.confluent.ksql.rest.server.context.ConfiguredKafkaClientSupplier;
 import io.confluent.ksql.rest.server.resources.streaming.WSQueryEndpoint.PrintTopicPublisher;
 import io.confluent.ksql.rest.server.resources.streaming.WSQueryEndpoint.QueryPublisher;
 import io.confluent.ksql.rest.server.resources.streaming.WSQueryEndpoint.UserServiceContextFactory;
-import io.confluent.ksql.rest.server.security.KsqlAuthorizationProvider;
-import io.confluent.ksql.rest.server.security.KsqlSecurityExtension;
-import io.confluent.ksql.rest.server.security.KsqlUserContextProvider;
 import io.confluent.ksql.rest.server.state.ServerState;
+import io.confluent.ksql.security.KsqlAuthorizationProvider;
+import io.confluent.ksql.security.KsqlAuthorizationValidator;
+import io.confluent.ksql.security.KsqlSecurityExtension;
+import io.confluent.ksql.security.KsqlUserContextProvider;
+import io.confluent.ksql.services.ConfiguredKafkaClientSupplier;
 import io.confluent.ksql.services.KafkaTopicClient;
 import io.confluent.ksql.services.ServiceContext;
 import io.confluent.ksql.statement.ConfiguredStatement;
@@ -135,7 +135,7 @@ public class WSQueryEndpointTest {
   @Mock
   private ActivenessRegistrar activenessRegistrar;
   @Mock
-  private TopicAccessValidator topicAccessValidator;
+  private KsqlAuthorizationValidator authorizationValidator;
   @Mock
   private KsqlSecurityExtension securityExtension;
   @Mock
@@ -157,10 +157,8 @@ public class WSQueryEndpointTest {
 
   @Before
   public void setUp() {
-    query = new Query(
-      mock(Select.class), mock(Relation.class),
-        Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), OptionalInt.empty()
-    );
+    query = new Query(Optional.empty(), mock(Select.class), mock(Relation.class), Optional.empty(),
+        Optional.empty(), Optional.empty(), Optional.empty(), OptionalInt.empty());
     when(session.getId()).thenReturn("session-id");
     when(session.getUserPrincipal()).thenReturn(principal);
     when(statementParser.parseSingleStatement(anyString()))
@@ -182,7 +180,7 @@ public class WSQueryEndpointTest {
     wsQueryEndpoint = new WSQueryEndpoint(
         ksqlConfig, OBJECT_MAPPER, statementParser, ksqlEngine, commandQueue, exec,
         queryPublisher, topicPublisher, activenessRegistrar, COMMAND_QUEUE_CATCHUP_TIMEOUT,
-        topicAccessValidator, securityExtension, serviceContextFactory,
+        authorizationValidator, securityExtension, serviceContextFactory,
         defaultServiceContextProvider, serverState);
   }
 

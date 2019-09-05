@@ -25,18 +25,21 @@ import static javax.ws.rs.core.Response.Status.UNAUTHORIZED;
 import io.confluent.ksql.rest.entity.KsqlEntityList;
 import io.confluent.ksql.rest.entity.KsqlErrorMessage;
 import io.confluent.ksql.rest.entity.KsqlStatementErrorMessage;
+import javax.ws.rs.core.HttpHeaders;
 import javax.ws.rs.core.Response;
 
 public final class Errors {
   private static final int HTTP_TO_ERROR_CODE_MULTIPLIER = 100;
 
   static final int ERROR_CODE_BAD_REQUEST = toErrorCode(BAD_REQUEST.getStatusCode());
-  static final int ERROR_CODE_BAD_STATEMENT = toErrorCode(BAD_REQUEST.getStatusCode()) + 1;
+  public static final int ERROR_CODE_BAD_STATEMENT = toErrorCode(BAD_REQUEST.getStatusCode()) + 1;
   private static final int ERROR_CODE_QUERY_ENDPOINT = toErrorCode(BAD_REQUEST.getStatusCode()) + 2;
 
   public static final int ERROR_CODE_UNAUTHORIZED = toErrorCode(UNAUTHORIZED.getStatusCode());
 
   public static final int ERROR_CODE_FORBIDDEN = toErrorCode(FORBIDDEN.getStatusCode());
+  public static final int ERROR_CODE_FORBIDDEN_KAFKA_ACCESS =
+      toErrorCode(FORBIDDEN.getStatusCode()) + 1;
 
   static final int ERROR_CODE_NOT_FOUND = toErrorCode(NOT_FOUND.getStatusCode());
 
@@ -63,10 +66,25 @@ public final class Errors {
     return statusCode * HTTP_TO_ERROR_CODE_MULTIPLIER;
   }
 
+  public static Response notReady() {
+    return Response
+        .status(SERVICE_UNAVAILABLE)
+        .header(HttpHeaders.RETRY_AFTER, 10)
+        .entity(new KsqlErrorMessage(ERROR_CODE_SERVER_NOT_READY, "Server initializing"))
+        .build();
+  }
+
   public static Response accessDenied(final String msg) {
     return Response
         .status(FORBIDDEN)
         .entity(new KsqlErrorMessage(ERROR_CODE_FORBIDDEN, msg))
+        .build();
+  }
+
+  public static Response accessDeniedFromKafka(final Throwable t) {
+    return Response
+        .status(FORBIDDEN)
+        .entity(new KsqlErrorMessage(ERROR_CODE_FORBIDDEN_KAFKA_ACCESS, t))
         .build();
   }
 
@@ -164,10 +182,10 @@ public final class Errors {
         .build();
   }
 
-  public static Response serverNotReady(final String reason) {
+  public static Response serverNotReady(final KsqlErrorMessage error) {
     return Response
         .status(SERVICE_UNAVAILABLE)
-        .entity(new KsqlErrorMessage(ERROR_CODE_SERVER_NOT_READY, reason))
+        .entity(error)
         .build();
   }
 }

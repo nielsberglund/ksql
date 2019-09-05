@@ -16,6 +16,7 @@
 package io.confluent.ksql.schema.ksql.inference;
 
 import com.google.common.collect.Iterables;
+import io.confluent.ksql.metastore.TypeRegistry;
 import io.confluent.ksql.parser.KsqlParser.PreparedStatement;
 import io.confluent.ksql.parser.SchemaParser;
 import io.confluent.ksql.parser.SqlFormatter;
@@ -31,8 +32,8 @@ import io.confluent.ksql.schema.ksql.inference.TopicSchemaSupplier.SchemaResult;
 import io.confluent.ksql.serde.Format;
 import io.confluent.ksql.statement.ConfiguredStatement;
 import io.confluent.ksql.statement.Injector;
+import io.confluent.ksql.util.IdentifierUtil;
 import io.confluent.ksql.util.KsqlStatementException;
-import io.confluent.ksql.util.ParserUtil;
 import java.util.Objects;
 import java.util.Optional;
 import org.apache.kafka.connect.data.Schema;
@@ -52,7 +53,7 @@ import org.apache.kafka.connect.data.Schema;
 public class DefaultSchemaInjector implements Injector {
 
   private static final SqlSchemaFormatter FORMATTER = new SqlSchemaFormatter(
-      ParserUtil::isReservedIdentifier, Option.AS_COLUMN_LIST);
+      IdentifierUtil::needsQuotes, Option.AS_COLUMN_LIST);
 
   private final TopicSchemaSupplier schemaSupplier;
 
@@ -139,7 +140,8 @@ public class DefaultSchemaInjector implements Injector {
   ) {
     try {
       throwOnInvalidSchema(schema);
-      return SchemaParser.parse(FORMATTER.format(schema));
+      // custom types cannot be injected, so we can pass in an EMPTY type registry
+      return SchemaParser.parse(FORMATTER.format(schema), TypeRegistry.EMPTY);
     } catch (final Exception e) {
       throw new KsqlStatementException(
           "Failed to convert schema to KSQL model: " + e.getMessage(),

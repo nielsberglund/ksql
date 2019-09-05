@@ -15,16 +15,24 @@
 
 package io.confluent.ksql.function;
 
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.is;
+
+import io.confluent.ksql.schema.ksql.types.SqlTypes;
 import java.util.Collections;
 import java.util.List;
 import java.util.function.Supplier;
 import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.streams.kstream.Merger;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
+import org.junit.runner.RunWith;
 import org.mockito.Mock;
+import org.mockito.junit.MockitoJUnitRunner;
 
+@RunWith(MockitoJUnitRunner.class)
 public class BaseAggregateFunctionTest {
 
   @Rule
@@ -48,6 +56,22 @@ public class BaseAggregateFunctionTest {
         Collections.emptyList(),
         "the description"
     );
+  }
+
+  @Test
+  public void shouldReturnSqlReturnType() {
+    // When:
+    final TestAggFunc aggFunc = new TestAggFunc(
+        "funcName",
+        0,
+        initialValueSupplier,
+        Schema.OPTIONAL_INT64_SCHEMA,
+        Collections.emptyList(),
+        "the description"
+    );
+
+    // Then:
+    assertThat(aggFunc.returnType(), is(SqlTypes.BIGINT));
   }
 
   private static final class TestAggFunc extends BaseAggregateFunction<String, Integer> {
@@ -76,7 +100,7 @@ public class BaseAggregateFunctionTest {
     }
 
     @Override
-    public Merger<String, Integer> getMerger() {
+    public Merger<Struct, Integer> getMerger() {
       return null;
     }
   }

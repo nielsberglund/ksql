@@ -22,24 +22,24 @@ import com.google.common.collect.ImmutableSet;
 import io.confluent.ksql.analyzer.Analysis.AliasedDataSource;
 import io.confluent.ksql.analyzer.Analysis.Into;
 import io.confluent.ksql.analyzer.Analysis.JoinInfo;
+import io.confluent.ksql.execution.expression.tree.ComparisonExpression;
+import io.confluent.ksql.execution.expression.tree.DereferenceExpression;
+import io.confluent.ksql.execution.expression.tree.Expression;
+import io.confluent.ksql.execution.expression.tree.QualifiedName;
+import io.confluent.ksql.execution.expression.tree.QualifiedNameReference;
 import io.confluent.ksql.metastore.MetaStore;
 import io.confluent.ksql.metastore.model.DataSource;
 import io.confluent.ksql.metastore.model.KsqlTopic;
 import io.confluent.ksql.parser.DefaultTraversalVisitor;
+import io.confluent.ksql.parser.NodeLocation;
 import io.confluent.ksql.parser.tree.AliasedRelation;
 import io.confluent.ksql.parser.tree.AllColumns;
 import io.confluent.ksql.parser.tree.AstNode;
-import io.confluent.ksql.parser.tree.Cast;
-import io.confluent.ksql.parser.tree.ComparisonExpression;
-import io.confluent.ksql.parser.tree.DereferenceExpression;
-import io.confluent.ksql.parser.tree.Expression;
 import io.confluent.ksql.parser.tree.GroupBy;
 import io.confluent.ksql.parser.tree.GroupingElement;
 import io.confluent.ksql.parser.tree.Join;
 import io.confluent.ksql.parser.tree.JoinOn;
-import io.confluent.ksql.parser.tree.NodeLocation;
-import io.confluent.ksql.parser.tree.QualifiedName;
-import io.confluent.ksql.parser.tree.QualifiedNameReference;
+import io.confluent.ksql.parser.tree.KsqlWindowExpression;
 import io.confluent.ksql.parser.tree.Query;
 import io.confluent.ksql.parser.tree.Select;
 import io.confluent.ksql.parser.tree.SelectItem;
@@ -51,11 +51,11 @@ import io.confluent.ksql.planner.plan.JoinNode;
 import io.confluent.ksql.schema.ksql.Field;
 import io.confluent.ksql.schema.ksql.LogicalSchema;
 import io.confluent.ksql.serde.Format;
-import io.confluent.ksql.serde.KsqlSerdeFactories;
-import io.confluent.ksql.serde.KsqlSerdeFactory;
-import io.confluent.ksql.serde.SerdeFactories;
+import io.confluent.ksql.serde.FormatInfo;
+import io.confluent.ksql.serde.KeyFormat;
 import io.confluent.ksql.serde.SerdeOption;
 import io.confluent.ksql.serde.SerdeOptions;
+import io.confluent.ksql.serde.ValueFormat;
 import io.confluent.ksql.util.KsqlException;
 import io.confluent.ksql.util.SchemaUtil;
 import java.util.ArrayList;
@@ -64,7 +64,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
-import org.apache.kafka.common.serialization.Serdes;
 
 // CHECKSTYLE_RULES.OFF: ClassDataAbstractionCoupling
 class Analyzer {
@@ -88,7 +87,6 @@ class Analyzer {
 
   private final MetaStore metaStore;
   private final String topicPrefix;
-  private final SerdeFactories serdeFactories;
   private final SerdeOptionsSupplier serdeOptionsSupplier;
   private final Set<SerdeOption> defaultSerdeOptions;
 
@@ -106,7 +104,6 @@ class Analyzer {
         metaStore,
         topicPrefix,
         defaultSerdeOptions,
-        new KsqlSerdeFactories(),
         SerdeOptions::buildForCreateAsStatement);
   }
 
@@ -115,34 +112,30 @@ class Analyzer {
       final MetaStore metaStore,
       final String topicPrefix,
       final Set<SerdeOption> defaultSerdeOptions,
-      final SerdeFactories serdeFactories,
       final SerdeOptionsSupplier serdeOptionsSupplier
   ) {
     this.metaStore = requireNonNull(metaStore, "metaStore");
     this.topicPrefix = requireNonNull(topicPrefix, "topicPrefix");
     this.defaultSerdeOptions = ImmutableSet
         .copyOf(requireNonNull(defaultSerdeOptions, "defaultSerdeOptions"));
-    this.serdeFactories = requireNonNull(serdeFactories, "serdeFactories");
     this.serdeOptionsSupplier = requireNonNull(serdeOptionsSupplier, "serdeOptionsSupplier");
   }
 
   /**
    * Analyze the query.
    *
-   * @param sqlExpression the sql expression being analysed.
    * @param query the query to analyze.
    * @param sink the sink the query will output to.
    * @return the analysis.
    */
   Analysis analyze(
-      final String sqlExpression,
       final Query query,
       final Optional<Sink> sink
   ) {
     final Visitor visitor = new Visitor();
     visitor.process(query, null);
 
-    visitor.analyzeSink(sink, sqlExpression);
+    sink.ifPresent(visitor::analyzeNonStdOutSink);
 
     visitor.validate();
 
@@ -157,17 +150,7 @@ class Analyzer {
     private boolean isJoin = false;
     private boolean isGroupBy = false;
 
-    private void analyzeSink(
-        final Optional<Sink> sink,
-        final String sqlExpression
-    ) {
-      sink.ifPresent(s -> analyzeNonStdOutSink(s, sqlExpression));
-    }
-
-    private void analyzeNonStdOutSink(
-        final Sink sink,
-        final String sqlExpression
-    ) {
+    private void analyzeNonStdOutSink(final Sink sink) {
       analysis.setProperties(sink.getProperties());
       sink.getPartitionBy().ifPresent(analysis::setPartitionBy);
 
@@ -180,11 +163,9 @@ class Analyzer {
         }
 
         analysis.setInto(Into.of(
-            sqlExpression,
             sink.getName(),
             false,
-            existing.getKsqlTopic(),
-            existing.getKeySerdeFactory()
+            existing.getKsqlTopic()
         ));
         return;
       }
@@ -192,21 +173,40 @@ class Analyzer {
       final String topicName = sink.getProperties().getKafkaTopic()
           .orElseGet(() -> topicPrefix + sink.getName());
 
-      final KsqlSerdeFactory valueSerdeFactory = getValueSerdeFactory(sink);
+      final KeyFormat keyFormat = buildKeyFormat();
+
+      final ValueFormat valueFormat = ValueFormat.of(FormatInfo.of(
+          getValueFormat(sink),
+          sink.getProperties().getValueAvroSchemaName()
+      ));
 
       final KsqlTopic intoKsqlTopic = new KsqlTopic(
           topicName,
-          valueSerdeFactory,
+          keyFormat,
+          valueFormat,
           true
       );
 
       analysis.setInto(Into.of(
-          sqlExpression,
           sink.getName(),
           true,
-          intoKsqlTopic,
-          Serdes::String
+          intoKsqlTopic
       ));
+    }
+
+    private KeyFormat buildKeyFormat() {
+      final Optional<KsqlWindowExpression> ksqlWindow = Optional
+          .ofNullable(analysis.getWindowExpression())
+          .map(WindowExpression::getKsqlWindowExpression);
+
+      return ksqlWindow
+          .map(w -> KeyFormat.windowed(FormatInfo.of(Format.KAFKA), w.getWindowInfo()))
+          .orElseGet(() -> analysis
+              .getFromDataSources()
+              .get(0)
+              .getDataSource()
+              .getKsqlTopic()
+              .getKeyFormat());
     }
 
     private void setSerdeOptions(final Sink sink) {
@@ -222,11 +222,6 @@ class Analyzer {
       );
 
       analysis.setSerdeOptions(serdeOptions);
-    }
-
-    private KsqlSerdeFactory getValueSerdeFactory(final Sink sink) {
-      final Format format = getValueFormat(sink);
-      return serdeFactories.create(format, sink.getProperties().getValueAvroSchemaName());
     }
 
     /**
@@ -276,7 +271,7 @@ class Analyzer {
               .get(0)
               .getDataSource()
               .getKsqlTopic()
-              .getValueSerdeFactory()
+              .getValueFormat()
               .getFormat());
     }
 
@@ -462,11 +457,6 @@ class Analyzer {
     }
 
     @Override
-    public AstNode visitCast(final Cast node, final Void context) {
-      return process(node.getExpression(), context);
-    }
-
-    @Override
     protected AstNode visitSelect(final Select node, final Void context) {
       for (final SelectItem selectItem : node.getSelectItems()) {
         if (selectItem instanceof AllColumns) {
@@ -480,14 +470,6 @@ class Analyzer {
         }
       }
       return null;
-    }
-
-    @Override
-    public AstNode visitQualifiedNameReference(
-        final QualifiedNameReference node,
-        final Void context
-    ) {
-      return visitExpression(node, context);
     }
 
     @Override
@@ -552,7 +534,7 @@ class Analyzer {
 
     public void validate() {
       final String kafkaSources = analysis.getFromDataSources().stream()
-          .filter(s -> s.getDataSource().getKsqlTopic().getValueSerdeFactory().getFormat()
+          .filter(s -> s.getDataSource().getKsqlTopic().getValueFormat().getFormat()
               == Format.KAFKA)
           .map(AliasedDataSource::getAlias)
           .collect(Collectors.joining(", "));

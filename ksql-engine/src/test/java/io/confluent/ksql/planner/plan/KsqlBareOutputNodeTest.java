@@ -25,16 +25,17 @@ import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import com.google.common.collect.ImmutableSet;
+import io.confluent.ksql.execution.builder.KsqlQueryBuilder;
+import io.confluent.ksql.execution.context.QueryContext;
 import io.confluent.ksql.function.FunctionRegistry;
 import io.confluent.ksql.function.InternalFunctionRegistry;
 import io.confluent.ksql.logging.processing.ProcessingLogContext;
 import io.confluent.ksql.metastore.MetaStore;
-import io.confluent.ksql.physical.KsqlQueryBuilder;
 import io.confluent.ksql.query.QueryId;
 import io.confluent.ksql.schema.ksql.Field;
 import io.confluent.ksql.schema.ksql.LogicalSchema;
 import io.confluent.ksql.schema.ksql.types.SqlTypes;
-import io.confluent.ksql.structured.QueryContext;
+import io.confluent.ksql.serde.KeySerde;
 import io.confluent.ksql.structured.SchemaKStream;
 import io.confluent.ksql.testutils.AnalysisTestUtil;
 import io.confluent.ksql.util.KsqlConfig;
@@ -45,6 +46,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.TopologyDescription;
 import org.junit.Before;
@@ -67,12 +69,16 @@ public class KsqlBareOutputNodeTest {
   private StreamsBuilder builder;
   private final MetaStore metaStore = MetaStoreFixture.getNewMetaStore(new InternalFunctionRegistry());
   private final QueryId queryId = new QueryId("output-test");
+  private final KsqlConfig ksqlConfig = new KsqlConfig(Collections.emptyMap());
 
   @Mock
   private KsqlQueryBuilder ksqlStreamBuilder;
   @Mock
   private FunctionRegistry functionRegistry;
+  @Mock
+  private KeySerde<Struct> keySerde;
 
+  @SuppressWarnings("unchecked")
   @Before
   public void before() {
     builder = new StreamsBuilder();
@@ -84,9 +90,10 @@ public class KsqlBareOutputNodeTest {
     when(ksqlStreamBuilder.buildNodeContext(any())).thenAnswer(inv ->
         new QueryContext.Stacker(queryId)
             .push(inv.getArgument(0).toString()));
+    when(ksqlStreamBuilder.buildKeySerde(any(), any(), any())).thenReturn(keySerde);
 
     final KsqlBareOutputNode planNode = (KsqlBareOutputNode) AnalysisTestUtil
-        .buildLogicalPlan(SIMPLE_SELECT_WITH_FILTER, metaStore);
+        .buildLogicalPlan(ksqlConfig, SIMPLE_SELECT_WITH_FILTER, metaStore);
 
     stream = planNode.buildStream(ksqlStreamBuilder);
   }
@@ -133,7 +140,7 @@ public class KsqlBareOutputNodeTest {
     // Given:
     final KsqlBareOutputNode node
         = (KsqlBareOutputNode) AnalysisTestUtil
-        .buildLogicalPlan("select col0 from test1;", metaStore);
+        .buildLogicalPlan(ksqlConfig, "select col0 from test1;", metaStore);
     final QueryIdGenerator queryIdGenerator = mock(QueryIdGenerator.class);
 
     // When:

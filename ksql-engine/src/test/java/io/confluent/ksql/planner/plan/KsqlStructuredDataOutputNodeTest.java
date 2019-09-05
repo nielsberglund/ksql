@@ -22,35 +22,30 @@ import static org.hamcrest.Matchers.sameInstance;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import io.confluent.ksql.GenericRow;
+import io.confluent.ksql.execution.builder.KsqlQueryBuilder;
+import io.confluent.ksql.execution.context.QueryContext;
+import io.confluent.ksql.execution.context.QueryLoggerUtil;
 import io.confluent.ksql.function.FunctionRegistry;
-import io.confluent.ksql.metastore.SerdeFactory;
 import io.confluent.ksql.metastore.model.DataSource.DataSourceType;
 import io.confluent.ksql.metastore.model.KeyField;
 import io.confluent.ksql.metastore.model.KsqlTopic;
-import io.confluent.ksql.physical.KsqlQueryBuilder;
-import io.confluent.ksql.planner.plan.KsqlStructuredDataOutputNode.SinKFactory;
 import io.confluent.ksql.query.QueryId;
 import io.confluent.ksql.schema.ksql.LogicalSchema;
-import io.confluent.ksql.schema.ksql.PersistenceSchema;
 import io.confluent.ksql.schema.ksql.PhysicalSchema;
+import io.confluent.ksql.serde.Format;
+import io.confluent.ksql.serde.FormatInfo;
 import io.confluent.ksql.serde.SerdeOption;
-import io.confluent.ksql.serde.avro.KsqlAvroSerdeFactory;
-import io.confluent.ksql.serde.json.KsqlJsonSerdeFactory;
-import io.confluent.ksql.structured.QueryContext;
+import io.confluent.ksql.serde.ValueFormat;
 import io.confluent.ksql.structured.SchemaKStream;
 import io.confluent.ksql.util.KsqlConfig;
 import io.confluent.ksql.util.QueryIdGenerator;
-import io.confluent.ksql.util.QueryLoggerUtil;
 import io.confluent.ksql.util.timestamp.LongColumnTimestampExtractionPolicy;
-import io.confluent.ksql.util.timestamp.MetadataTimestampExtractionPolicy;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
@@ -87,10 +82,6 @@ public class KsqlStructuredDataOutputNodeTest {
       .field("key", Schema.OPTIONAL_STRING_SCHEMA)
       .build());
 
-  private static final LogicalSchema SINGLE_FIELD_SCHEMA = LogicalSchema.of(SchemaBuilder.struct()
-      .field("field1", Schema.OPTIONAL_STRING_SCHEMA)
-      .build());
-
   private static final KeyField KEY_FIELD =
       KeyField.of("key", SCHEMA.findValueField("key").get());
   private static final PlanNodeId PLAN_NODE_ID = new PlanNodeId("0");
@@ -115,13 +106,7 @@ public class KsqlStructuredDataOutputNodeTest {
   @Mock
   private SchemaKStream<?> resultWithKeySelected;
   @Mock
-  private SerdeFactory<String> keySerdeFactory;
-  @Mock
   private KStream<String, GenericRow> kstream;
-  @Mock
-  private SinKFactory<String> sinkFactory;
-  @Mock
-  private KsqlJsonSerdeFactory sinkValueSerdeFactory;
   @Mock
   private KsqlTopic ksqlTopic;
   @Mock
@@ -148,26 +133,20 @@ public class KsqlStructuredDataOutputNodeTest {
     when(sourceNode.getNodeOutputType()).thenReturn(DataSourceType.KSTREAM);
     when(sourceNode.buildStream(ksqlStreamBuilder)).thenReturn((SchemaKStream) sourceStream);
 
-    when(sourceStream.getSchema()).thenReturn(SCHEMA.withMetaAndKeyFieldsInValue());
     when(sourceStream.getKeyField()).thenReturn(KeyField.none());
-    when(sourceStream.getKeySerdeFactory()).thenReturn(keySerdeFactory);
-    when(sourceStream.getKstream()).thenReturn((KStream) kstream);
 
-    when(sinkFactory.create(any(), any(), any(), any(), any(), any(), any(), any(), any()))
+    when(sourceStream.sink(any(), any()))
         .thenReturn(resultStream);
 
     when(resultStream.selectKey(any(), anyBoolean(), any()))
         .thenReturn((SchemaKStream) resultWithKeySelected);
 
-    when(ksqlStreamBuilder.getKsqlConfig()).thenReturn(ksqlConfig);
-    when(ksqlStreamBuilder.getFunctionRegistry()).thenReturn(functionRegistry);
-    when(ksqlStreamBuilder.buildGenericRowSerde(any(), any(), any())).thenReturn(rowSerde);
+    when(ksqlStreamBuilder.buildValueSerde(any(), any(), any())).thenReturn(rowSerde);
     when(ksqlStreamBuilder.buildNodeContext(any())).thenAnswer(inv ->
         new QueryContext.Stacker(QUERY_ID)
             .push(inv.getArgument(0).toString()));
-
     when(ksqlTopic.getKafkaTopicName()).thenReturn(SINK_KAFKA_TOPIC_NAME);
-    when(ksqlTopic.getValueSerdeFactory()).thenReturn(sinkValueSerdeFactory);
+    when(ksqlTopic.getValueFormat()).thenReturn(ValueFormat.of(FormatInfo.of(Format.JSON)));
 
     buildNode();
   }
@@ -221,13 +200,12 @@ public class KsqlStructuredDataOutputNodeTest {
     outputNode.buildStream(ksqlStreamBuilder);
 
     // Then:
-    final InOrder inOrder = Mockito.inOrder(sourceNode, sinkFactory);
+    final InOrder inOrder = Mockito.inOrder(sourceNode, sourceStream);
 
     inOrder.verify(sourceNode)
         .buildStream(any());
 
-    inOrder.verify(sinkFactory)
-        .create(any(), any(), any(), any(), any(), any(), any(), any(), any());
+    inOrder.verify(sourceStream).sink(any(), any());
   }
 
   @Test
@@ -236,16 +214,9 @@ public class KsqlStructuredDataOutputNodeTest {
     outputNode.buildStream(ksqlStreamBuilder);
 
     // Then:
-    verify(sinkFactory).create(
-        sourceStream.getSchema(),
-        sourceStream.getKstream(),
+    verify(sourceStream).sink(
         KEY_FIELD.withName(Optional.empty()),
-        ImmutableList.of(sourceStream),
-        sourceStream.getKeySerdeFactory(),
-        SchemaKStream.Type.SINK,
-        ksqlConfig,
-        functionRegistry,
-        new QueryContext.Stacker(QUERY_ID).push(PLAN_NODE_ID.toString()).getQueryContext()
+        new QueryContext.Stacker(QUERY_ID).push(PLAN_NODE_ID.toString())
     );
   }
 
@@ -345,16 +316,16 @@ public class KsqlStructuredDataOutputNodeTest {
     // Given:
     givenInsertIntoNode();
 
-    final KsqlAvroSerdeFactory avroSerdeFactory = new KsqlAvroSerdeFactory("name");
+    final ValueFormat valueFormat = ValueFormat.of(FormatInfo.of(Format.AVRO, Optional.of("name")));
 
-    when(ksqlTopic.getValueSerdeFactory()).thenReturn(avroSerdeFactory);
+    when(ksqlTopic.getValueFormat()).thenReturn(valueFormat);
 
     // When/Then (should not throw):
     outputNode.buildStream(ksqlStreamBuilder);
 
     // Then:
-    verify(ksqlStreamBuilder).buildGenericRowSerde(
-        eq(avroSerdeFactory),
+    verify(ksqlStreamBuilder).buildValueSerde(
+        eq(valueFormat.getFormatInfo()),
         any(),
         any()
     );
@@ -366,8 +337,8 @@ public class KsqlStructuredDataOutputNodeTest {
     outputNode.buildStream(ksqlStreamBuilder);
 
     // Then:
-    verify(ksqlStreamBuilder).buildGenericRowSerde(
-        eq(sinkValueSerdeFactory),
+    verify(ksqlStreamBuilder).buildValueSerde(
+        eq(FormatInfo.of(Format.JSON)),
         eq(PhysicalSchema.from(SCHEMA, serdeOptions)),
         queryContextCaptor.capture()
     );
@@ -432,34 +403,6 @@ public class KsqlStructuredDataOutputNodeTest {
     );
   }
 
-  @Test
-  public void shouldValidateValueFormatCanHandleValueSchema() {
-    // Given:
-    clearInvocations(sinkValueSerdeFactory);
-    final Set<SerdeOption> serdeOptions = SerdeOption.of(SerdeOption.UNWRAP_SINGLE_VALUES);
-
-    // When:
-    new KsqlStructuredDataOutputNode(
-        new PlanNodeId("0"),
-        sourceNode,
-        SINGLE_FIELD_SCHEMA,
-        new MetadataTimestampExtractionPolicy(),
-        KeyField.none(),
-        ksqlTopic,
-        Optional.empty(),
-        OptionalInt.empty(),
-        false,
-        serdeOptions
-    );
-
-    // Then:
-    final PersistenceSchema expected = PhysicalSchema
-        .from(SINGLE_FIELD_SCHEMA, serdeOptions)
-        .valueSchema();
-
-    verify(sinkValueSerdeFactory).validate(expected);
-  }
-
   private void givenInsertIntoNode() {
     this.createInto = false;
     buildNode();
@@ -486,8 +429,7 @@ public class KsqlStructuredDataOutputNodeTest {
         partitionBy,
         OptionalInt.empty(),
         createInto,
-        SerdeOption.none(),
-        sinkFactory
+        SerdeOption.none()
     );
   }
 }

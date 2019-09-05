@@ -16,8 +16,8 @@
 package io.confluent.ksql.rest.server.resources.streaming;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.annotations.VisibleForTesting;
 import io.confluent.ksql.engine.KsqlEngine;
-import io.confluent.ksql.engine.TopicAccessValidator;
 import io.confluent.ksql.json.JsonMapper;
 import io.confluent.ksql.parser.KsqlParser.PreparedStatement;
 import io.confluent.ksql.parser.tree.PrintTopic;
@@ -27,8 +27,11 @@ import io.confluent.ksql.rest.entity.Versions;
 import io.confluent.ksql.rest.server.StatementParser;
 import io.confluent.ksql.rest.server.computation.CommandQueue;
 import io.confluent.ksql.rest.server.resources.Errors;
+import io.confluent.ksql.rest.server.resources.KsqlConfigurable;
 import io.confluent.ksql.rest.server.resources.KsqlRestException;
 import io.confluent.ksql.rest.util.CommandStoreUtil;
+import io.confluent.ksql.rest.util.ErrorResponseUtil;
+import io.confluent.ksql.security.KsqlAuthorizationValidator;
 import io.confluent.ksql.services.ServiceContext;
 import io.confluent.ksql.statement.ConfiguredStatement;
 import io.confluent.ksql.util.KsqlConfig;
@@ -47,17 +50,18 @@ import javax.ws.rs.Produces;
 import javax.ws.rs.core.Context;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
+import org.apache.kafka.common.errors.TopicAuthorizationException;
+import org.apache.kafka.streams.StreamsConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 @Path("/query")
 @Produces({Versions.KSQL_V1_JSON, MediaType.APPLICATION_JSON})
 @Consumes({Versions.KSQL_V1_JSON, MediaType.APPLICATION_JSON})
-public class StreamedQueryResource {
+public class StreamedQueryResource implements KsqlConfigurable {
 
   private static final Logger log = LoggerFactory.getLogger(StreamedQueryResource.class);
 
-  private final KsqlConfig ksqlConfig;
   private final KsqlEngine ksqlEngine;
   private final StatementParser statementParser;
   private final CommandQueue commandQueue;
@@ -65,19 +69,38 @@ public class StreamedQueryResource {
   private final Duration commandQueueCatchupTimeout;
   private final ObjectMapper objectMapper;
   private final ActivenessRegistrar activenessRegistrar;
-  private final TopicAccessValidator topicAccessValidator;
+  private final KsqlAuthorizationValidator authorizationValidator;
+  private KsqlConfig ksqlConfig;
 
   public StreamedQueryResource(
-      final KsqlConfig ksqlConfig,
+      final KsqlEngine ksqlEngine,
+      final CommandQueue commandQueue,
+      final Duration disconnectCheckInterval,
+      final Duration commandQueueCatchupTimeout,
+      final ActivenessRegistrar activenessRegistrar,
+      final KsqlAuthorizationValidator authorizationValidator
+  ) {
+    this(
+        ksqlEngine,
+        new StatementParser(ksqlEngine),
+        commandQueue,
+        disconnectCheckInterval,
+        commandQueueCatchupTimeout,
+        activenessRegistrar,
+        authorizationValidator
+    );
+  }
+
+  @VisibleForTesting
+  StreamedQueryResource(
       final KsqlEngine ksqlEngine,
       final StatementParser statementParser,
       final CommandQueue commandQueue,
       final Duration disconnectCheckInterval,
       final Duration commandQueueCatchupTimeout,
       final ActivenessRegistrar activenessRegistrar,
-      final TopicAccessValidator topicAccessValidator
+      final KsqlAuthorizationValidator authorizationValidator
   ) {
-    this.ksqlConfig = Objects.requireNonNull(ksqlConfig, "ksqlConfig");
     this.ksqlEngine = Objects.requireNonNull(ksqlEngine, "ksqlEngine");
     this.statementParser = Objects.requireNonNull(statementParser, "statementParser");
     this.commandQueue = Objects.requireNonNull(commandQueue, "commandQueue");
@@ -88,14 +111,25 @@ public class StreamedQueryResource {
     this.objectMapper = JsonMapper.INSTANCE.mapper;
     this.activenessRegistrar =
         Objects.requireNonNull(activenessRegistrar, "activenessRegistrar");
-    this.topicAccessValidator = topicAccessValidator;
+    this.authorizationValidator = authorizationValidator;
+  }
+
+  @Override
+  public void configure(final KsqlConfig config) {
+    if (!config.getKsqlStreamConfigProps().containsKey(StreamsConfig.APPLICATION_SERVER_CONFIG)) {
+      throw new IllegalArgumentException("Need KS application server set");
+    }
+
+    ksqlConfig = config;
   }
 
   @POST
   public Response streamQuery(
       @Context final ServiceContext serviceContext,
       final KsqlRequest request
-  ) throws Exception {
+  ) {
+    throwIfNotConfigured();
+
     activenessRegistrar.updateLastRequestTime();
 
     final PreparedStatement<?> statement = parseStatement(request);
@@ -104,6 +138,12 @@ public class StreamedQueryResource {
         commandQueue, request, commandQueueCatchupTimeout);
 
     return handleStatement(serviceContext, request, statement);
+  }
+
+  private void throwIfNotConfigured() {
+    if (ksqlConfig == null) {
+      throw new KsqlRestException(Errors.notReady());
+    }
   }
 
   private PreparedStatement<?> parseStatement(final KsqlRequest request) {
@@ -124,8 +164,14 @@ public class StreamedQueryResource {
       final ServiceContext serviceContext,
       final KsqlRequest request,
       final PreparedStatement<?> statement
-  ) throws Exception {
+  )  {
     try {
+      authorizationValidator.checkAuthorization(
+          serviceContext,
+          ksqlEngine.getMetaStore(),
+          statement.getStatement()
+      );
+
       if (statement.getStatement() instanceof Query) {
         return handleQuery(
             serviceContext,
@@ -144,8 +190,11 @@ public class StreamedQueryResource {
       return Errors.badRequest(String.format(
           "Statement type `%s' not supported for this resource",
           statement.getClass().getName()));
+    } catch (final TopicAuthorizationException e) {
+      return Errors.accessDeniedFromKafka(e);
     } catch (final KsqlException e) {
-      return Errors.badRequest(e);
+      return ErrorResponseUtil.generateResponse(
+          e, Errors.badRequest(e));
     }
   }
 
@@ -153,22 +202,16 @@ public class StreamedQueryResource {
       final ServiceContext serviceContext,
       final PreparedStatement<Query> statement,
       final Map<String, Object> streamsProperties
-  ) throws Exception {
+  ) {
     final ConfiguredStatement<Query> configured =
         ConfiguredStatement.of(statement, streamsProperties, ksqlConfig);
-
-    topicAccessValidator.validate(
-        serviceContext,
-        ksqlEngine.getMetaStore(),
-        statement.getStatement()
-    );
 
     final QueryMetadata query = ksqlEngine.execute(serviceContext, configured)
         .getQuery()
         .get();
 
     if (!(query instanceof TransientQueryMetadata)) {
-      throw new Exception(String.format(
+      throw new IllegalStateException(String.format(
           "Unexpected metadata type: expected TransientQueryMetadata, found %s instead",
           query.getClass()
       ));

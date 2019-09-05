@@ -29,6 +29,7 @@ import io.confluent.ksql.util.KsqlException;
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.function.Function;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
@@ -130,6 +131,10 @@ public final class SchemaConverters {
      * @return the java type.
      */
     Class<?> toJavaType(SqlBaseType sqlBaseType);
+
+    default Class<?> toJavaType(SqlType sqlType) {
+      return toJavaType(sqlType.baseType());
+    }
   }
 
   public static ConnectToSqlTypeConverter connectToSqlConverter() {
@@ -257,7 +262,7 @@ public final class SchemaConverters {
       final SchemaBuilder builder = SchemaBuilder.struct();
 
       struct.getFields()
-          .forEach(field -> builder.field(field.getName(), connectType(field.getType()).build()));
+          .forEach(field -> builder.field(field.fullName(), connectType(field.type()).build()));
 
       return builder
           .optional();
@@ -281,12 +286,11 @@ public final class SchemaConverters {
 
     @Override
     public SqlBaseType toSqlType(final Class<?> javaType) {
-      final SqlBaseType sqlType = JAVA_TO_SQL.get(javaType);
-      if (sqlType == null) {
-        throw new KsqlException("Unexpected java type: " + javaType);
-      }
-
-      return sqlType;
+      return JAVA_TO_SQL.entrySet().stream()
+          .filter(e -> e.getKey().isAssignableFrom(javaType))
+          .map(Entry::getValue)
+          .findAny()
+          .orElseThrow(() -> new KsqlException("Unexpected java type: " + javaType));
     }
   }
 

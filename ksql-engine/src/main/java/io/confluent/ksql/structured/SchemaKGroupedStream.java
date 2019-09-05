@@ -16,38 +16,40 @@
 package io.confluent.ksql.structured;
 
 import io.confluent.ksql.GenericRow;
+import io.confluent.ksql.execution.context.QueryContext;
 import io.confluent.ksql.function.FunctionRegistry;
 import io.confluent.ksql.function.KsqlAggregateFunction;
 import io.confluent.ksql.function.UdafAggregator;
 import io.confluent.ksql.function.udaf.KudafAggregator;
 import io.confluent.ksql.function.udaf.window.WindowSelectMapper;
-import io.confluent.ksql.metastore.SerdeFactory;
 import io.confluent.ksql.metastore.model.KeyField;
+import io.confluent.ksql.model.WindowType;
 import io.confluent.ksql.parser.tree.KsqlWindowExpression;
 import io.confluent.ksql.parser.tree.WindowExpression;
 import io.confluent.ksql.schema.ksql.LogicalSchema;
+import io.confluent.ksql.serde.KeySerde;
+import io.confluent.ksql.serde.WindowInfo;
 import io.confluent.ksql.streams.MaterializedFactory;
 import io.confluent.ksql.streams.StreamsUtil;
 import io.confluent.ksql.util.KsqlConfig;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import org.apache.kafka.common.serialization.Serde;
-import org.apache.kafka.common.serialization.Serdes;
-import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.streams.kstream.Initializer;
 import org.apache.kafka.streams.kstream.KGroupedStream;
 import org.apache.kafka.streams.kstream.KTable;
 import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Windowed;
-import org.apache.kafka.streams.kstream.WindowedSerdes;
-import org.apache.kafka.streams.state.KeyValueStore;
-import org.apache.kafka.streams.state.WindowStore;
 
 public class SchemaKGroupedStream {
 
-  final LogicalSchema schema;
   final KGroupedStream kgroupedStream;
+  final LogicalSchema schema;
+  final KeySerde<Struct> keySerde;
   final KeyField keyField;
   final List<SchemaKStream> sourceSchemaKStreams;
   final KsqlConfig ksqlConfig;
@@ -55,16 +57,17 @@ public class SchemaKGroupedStream {
   final MaterializedFactory materializedFactory;
 
   SchemaKGroupedStream(
-      final LogicalSchema schema,
       final KGroupedStream kgroupedStream,
+      final LogicalSchema schema,
+      final KeySerde<Struct> keySerde,
       final KeyField keyField,
       final List<SchemaKStream> sourceSchemaKStreams,
       final KsqlConfig ksqlConfig,
       final FunctionRegistry functionRegistry
   ) {
     this(
-        schema,
-        kgroupedStream,
+        kgroupedStream, schema,
+        keySerde,
         keyField,
         sourceSchemaKStreams,
         ksqlConfig,
@@ -74,16 +77,18 @@ public class SchemaKGroupedStream {
   }
 
   SchemaKGroupedStream(
-      final LogicalSchema schema,
       final KGroupedStream kgroupedStream,
+      final LogicalSchema schema,
+      final KeySerde<Struct> keySerde,
       final KeyField keyField,
       final List<SchemaKStream> sourceSchemaKStreams,
       final KsqlConfig ksqlConfig,
       final FunctionRegistry functionRegistry,
       final MaterializedFactory materializedFactory
   ) {
-    this.schema = schema;
     this.kgroupedStream = kgroupedStream;
+    this.schema = schema;
+    this.keySerde = Objects.requireNonNull(keySerde, "keySerde");
     this.keyField = keyField;
     this.sourceSchemaKStreams = sourceSchemaKStreams;
     this.ksqlConfig = Objects.requireNonNull(ksqlConfig, "ksqlConfig");
@@ -97,41 +102,47 @@ public class SchemaKGroupedStream {
 
   @SuppressWarnings("unchecked")
   public SchemaKTable<?> aggregate(
+      final LogicalSchema aggregateSchema,
       final Initializer initializer,
+      final int nonFuncColumnCount,
       final Map<Integer, KsqlAggregateFunction> aggValToFunctionMap,
-      final Map<Integer, Integer> aggValToValColumnMap,
       final WindowExpression windowExpression,
       final Serde<GenericRow> topicValueSerDe,
-      final QueryContext.Stacker contextStacker) {
+      final QueryContext.Stacker contextStacker
+  ) {
+    throwOnValueFieldCountMismatch(aggregateSchema, nonFuncColumnCount, aggValToFunctionMap);
 
     final KTable table;
-    final SerdeFactory<?> keySerdeFactory;
+    final KeySerde<?> newKeySerde;
     if (windowExpression != null) {
-      keySerdeFactory = getKeySerde(windowExpression);
+      newKeySerde = getKeySerde(windowExpression);
+
       table = aggregateWindowed(
           initializer,
+          nonFuncColumnCount,
           aggValToFunctionMap,
-          aggValToValColumnMap,
           windowExpression,
           topicValueSerDe,
-          contextStacker);
+          contextStacker
+      );
     } else {
-      keySerdeFactory = (SerdeFactory)Serdes::String;
+      newKeySerde = keySerde;
 
       table = aggregateNonWindowed(
           initializer,
+          nonFuncColumnCount,
           aggValToFunctionMap,
-          aggValToValColumnMap,
           topicValueSerDe,
-          contextStacker);
+          contextStacker
+      );
     }
 
     return new SchemaKTable(
-        schema,
         table,
+        aggregateSchema,
+        newKeySerde,
         keyField,
         sourceSchemaKStreams,
-        keySerdeFactory,
         SchemaKStream.Type.AGGREGATE,
         ksqlConfig,
         functionRegistry,
@@ -141,42 +152,42 @@ public class SchemaKGroupedStream {
   @SuppressWarnings("unchecked")
   private KTable aggregateNonWindowed(
       final Initializer initializer,
+      final int nonFuncColumnCount,
       final Map<Integer, KsqlAggregateFunction> indexToFunctionMap,
-      final Map<Integer, Integer> indexToValueMap,
       final Serde<GenericRow> topicValueSerDe,
-      final QueryContext.Stacker contextStacker) {
+      final QueryContext.Stacker contextStacker
+  ) {
+    final UdafAggregator aggregator = new KudafAggregator(nonFuncColumnCount, indexToFunctionMap);
 
-    final UdafAggregator aggregator = new KudafAggregator(
-        indexToFunctionMap, indexToValueMap);
+    final Materialized<Struct, GenericRow, ?> materialized = materializedFactory.create(
+        keySerde,
+        topicValueSerDe,
+        StreamsUtil.buildOpName(contextStacker.getQueryContext())
+    );
 
-    final Materialized<String, GenericRow, KeyValueStore<Bytes, byte[]>> materialized
-          = materializedFactory.create(
-              Serdes.String(),
-              topicValueSerDe,
-              StreamsUtil.buildOpName(contextStacker.getQueryContext()));
     return kgroupedStream.aggregate(initializer, aggregator, materialized);
   }
 
   @SuppressWarnings("unchecked")
   private KTable aggregateWindowed(
       final Initializer initializer,
+      final int nonFuncColumnCount,
       final Map<Integer, KsqlAggregateFunction> indexToFunctionMap,
-      final Map<Integer, Integer> indexToValueMap,
       final WindowExpression windowExpression,
       final Serde<GenericRow> topicValueSerDe,
-      final QueryContext.Stacker contextStacker) {
-
-    final UdafAggregator aggregator = new KudafAggregator(
-        indexToFunctionMap, indexToValueMap);
+      final QueryContext.Stacker contextStacker
+  ) {
+    final UdafAggregator aggregator = new KudafAggregator(nonFuncColumnCount, indexToFunctionMap);
 
     final KsqlWindowExpression ksqlWindowExpression = windowExpression.getKsqlWindowExpression();
 
-    final Materialized<String, GenericRow, WindowStore<Bytes, byte[]>> materialized
-          = materializedFactory.create(
-              Serdes.String(),
-              topicValueSerDe,
-              StreamsUtil.buildOpName(contextStacker.getQueryContext()));
-    final KTable aggKtable = ksqlWindowExpression.applyAggregate(
+    final Materialized<Struct, GenericRow, ?> materialized = materializedFactory.create(
+        keySerde,
+        topicValueSerDe,
+        StreamsUtil.buildOpName(contextStacker.getQueryContext())
+    );
+
+    final KTable<Windowed<Struct>, GenericRow> aggKtable = ksqlWindowExpression.applyAggregate(
         kgroupedStream, initializer, aggregator, materialized);
 
     final WindowSelectMapper windowSelectMapper = new WindowSelectMapper(indexToFunctionMap);
@@ -184,15 +195,36 @@ public class SchemaKGroupedStream {
       return aggKtable;
     }
 
-    return aggKtable.mapValues((readOnlyKey, value) ->
-        windowSelectMapper.apply((Windowed<?>) readOnlyKey, (GenericRow) value));
+    return aggKtable.mapValues(windowSelectMapper);
   }
 
-  private SerdeFactory<Windowed<String>> getKeySerde(final WindowExpression windowExpression) {
+  private KeySerde<Windowed<Struct>> getKeySerde(final WindowExpression windowExpression) {
     if (ksqlConfig.getBoolean(KsqlConfig.KSQL_WINDOWED_SESSION_KEY_LEGACY_CONFIG)) {
-      return () -> WindowedSerdes.timeWindowedSerdeFrom(String.class);
+      return keySerde.rebind(WindowInfo.of(
+          WindowType.TUMBLING,
+          Optional.of(Duration.ofMillis(Long.MAX_VALUE))
+      ));
     }
 
-    return windowExpression.getKsqlWindowExpression().getKeySerdeFactory(String.class);
+    return keySerde.rebind(windowExpression.getKsqlWindowExpression().getWindowInfo());
+  }
+
+  static void throwOnValueFieldCountMismatch(
+      final LogicalSchema aggregateSchema,
+      final int nonFuncColumnCount,
+      final Map<Integer, KsqlAggregateFunction> aggValToFunctionMap
+  ) {
+    final int nonAggColumnCount = aggValToFunctionMap.size();
+    final int totalColumnCount = nonAggColumnCount + nonFuncColumnCount;
+
+    final int valueColumnCount = aggregateSchema.valueFields().size();
+    if (valueColumnCount != totalColumnCount) {
+      throw new IllegalArgumentException(
+          "Aggregate schema value field count does not match expected."
+          + " expected: " + totalColumnCount
+          + ", actual: " + valueColumnCount
+          + ", schema: " + aggregateSchema
+      );
+    }
   }
 }

@@ -20,12 +20,12 @@ import static java.util.Objects.requireNonNull;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import com.google.common.collect.Sets.SetView;
+import io.confluent.ksql.execution.expression.tree.DereferenceExpression;
+import io.confluent.ksql.execution.expression.tree.Expression;
+import io.confluent.ksql.execution.expression.tree.FunctionCall;
+import io.confluent.ksql.execution.expression.tree.QualifiedName;
 import io.confluent.ksql.metastore.MetaStore;
-import io.confluent.ksql.parser.tree.DereferenceExpression;
-import io.confluent.ksql.parser.tree.Expression;
-import io.confluent.ksql.parser.tree.ExpressionTreeRewriter;
-import io.confluent.ksql.parser.tree.FunctionCall;
-import io.confluent.ksql.parser.tree.QualifiedName;
+import io.confluent.ksql.parser.rewrite.ExpressionTreeRewriter;
 import io.confluent.ksql.parser.tree.Query;
 import io.confluent.ksql.parser.tree.Sink;
 import io.confluent.ksql.serde.SerdeOption;
@@ -53,12 +53,11 @@ public class QueryAnalyzer {
   }
 
   public Analysis analyze(
-      final String sqlExpression,
       final Query query,
       final Optional<Sink> sink
   ) {
     return new Analyzer(metaStore, outputTopicPrefix, defaultSerdeOptions)
-        .analyze(sqlExpression, query, sink);
+        .analyze(query, sink);
   }
 
   public AggregateAnalysis analyzeAggregate(final Query query, final Analysis analysis) {
@@ -115,7 +114,7 @@ public class QueryAnalyzer {
     aggregateAnalyzer.processHaving(exp);
 
     aggregateAnalysis.setHavingExpression(
-        ExpressionTreeRewriter.rewriteWith(aggregateExpressionRewriter,exp));
+        ExpressionTreeRewriter.rewriteWith(aggregateExpressionRewriter::process, exp));
   }
 
   private static void processGroupByExpression(
@@ -137,7 +136,7 @@ public class QueryAnalyzer {
       aggregateAnalyzer.processSelect(exp);
 
       aggregateAnalysis.addFinalSelectExpression(
-          ExpressionTreeRewriter.rewriteWith(aggregateExpressionRewriter, exp));
+          ExpressionTreeRewriter.rewriteWith(aggregateExpressionRewriter::process, exp));
     }
   }
 

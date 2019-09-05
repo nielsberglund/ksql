@@ -20,6 +20,7 @@ import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.is;
 
 import com.google.common.testing.EqualsTester;
+import io.confluent.ksql.schema.ksql.Field;
 import io.confluent.ksql.schema.ksql.FormatOptions;
 import io.confluent.ksql.schema.ksql.SqlBaseType;
 import io.confluent.ksql.util.KsqlException;
@@ -64,18 +65,13 @@ public class SqlStructTest {
 
     // Then:
     assertThat(struct.getFields(), contains(
-        new SqlStruct.Field("f0", SqlTypes.BIGINT),
-        new SqlStruct.Field("f1", SqlTypes.DOUBLE)
+        Field.of("f0", SqlTypes.BIGINT),
+        Field.of("f1", SqlTypes.DOUBLE)
     ));
   }
 
   @Test
-  public void shouldThrowIfNoFields() {
-    // Then:
-    expectedException.expect(KsqlException.class);
-    expectedException.expectMessage("STRUCT type must define fields");
-
-    // When:
+  public void shouldNotThrowIfNoFields() {
     SqlStruct.builder().build();
   }
 
@@ -84,7 +80,7 @@ public class SqlStructTest {
     // Then:
     expectedException.expect(KsqlException.class);
     expectedException.expectMessage(
-        "Duplicate field names found in STRUCT: 'F0 BOOLEAN' and 'F0 INTEGER'");
+        "Duplicate field names found in STRUCT: '`F0` BOOLEAN' and '`F0` INTEGER'");
 
     // When:
     SqlStruct.builder()

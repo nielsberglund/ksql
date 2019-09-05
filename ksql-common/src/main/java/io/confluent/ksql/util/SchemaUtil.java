@@ -27,18 +27,20 @@ import com.google.common.collect.ImmutableSortedMap;
 import com.google.common.collect.Ordering;
 import io.confluent.ksql.schema.Operator;
 import io.confluent.ksql.schema.ksql.PersistenceSchema;
-import java.math.BigDecimal;
+import io.confluent.ksql.schema.ksql.SchemaConverters;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.BiPredicate;
 import org.apache.avro.LogicalTypes;
 import org.apache.avro.SchemaBuilder.FieldAssembler;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.Schema.Type;
 import org.apache.kafka.connect.data.SchemaBuilder;
-import org.apache.kafka.connect.data.Struct;
 
 public final class SchemaUtil {
 
@@ -74,18 +76,6 @@ public final class SchemaUtil {
           .put(Schema.Type.FLOAT64, Schema.OPTIONAL_FLOAT64_SCHEMA)
           .build();
 
-  private static final Map<Schema.Type, Class<?>> SCHEMA_TYPE_TO_JAVA_TYPE =
-      ImmutableMap.<Schema.Type, Class<?>>builder()
-          .put(Schema.Type.STRING, String.class)
-          .put(Schema.Type.BOOLEAN, Boolean.class)
-          .put(Schema.Type.INT32, Integer.class)
-          .put(Schema.Type.INT64, Long.class)
-          .put(Schema.Type.FLOAT64, Double.class)
-          .put(Schema.Type.ARRAY, List.class)
-          .put(Schema.Type.MAP, Map.class)
-          .put(Schema.Type.STRUCT, Struct.class)
-          .build();
-
   private static final char FIELD_NAME_DELIMITER = '.';
 
   private static final ImmutableMap<Schema.Type, String> SCHEMA_TYPE_TO_CAST_STRING =
@@ -97,25 +87,23 @@ public final class SchemaUtil {
           .put(Schema.Type.BOOLEAN, "(Boolean)")
           .build();
 
+  private static final Map<Type, BiPredicate<Schema, Schema>> CUSTOM_SCHEMA_EQ =
+      ImmutableMap.<Type, BiPredicate<Schema, Schema>>builder()
+          .put(Type.MAP, SchemaUtil::mapEquals)
+          .put(Type.ARRAY, SchemaUtil::arrayEquals)
+          .put(Type.STRUCT, SchemaUtil::structEquals)
+          .put(Type.BYTES, SchemaUtil::bytesEquals)
+          .build();
+
+
   private SchemaUtil() {
   }
 
+  // Do Not use in new code - use `SchemaConverters` directly.
   public static Class<?> getJavaType(final Schema schema) {
-    if (DecimalUtil.isDecimal(schema)) {
-      return BigDecimal.class;
-    }
-
-    final Class<?> typeClazz = SCHEMA_TYPE_TO_JAVA_TYPE.get(schema.type());
-    if (typeClazz == null) {
-      throw new KsqlException("Type is not supported: " + schema.type());
-    }
-
-    return typeClazz;
-  }
-
-  public static boolean matchFieldName(final Field field, final String fieldName) {
-    return field.name().equals(fieldName)
-        || field.name().equals(getFieldNameWithNoAlias(fieldName));
+    return SchemaConverters.sqlToJavaConverter().toJavaType(
+        SchemaConverters.connectToSqlConverter().toSqlType(schema)
+    );
   }
 
   /**
@@ -132,10 +120,6 @@ public final class SchemaUtil {
         || required.equals(getFieldNameWithNoAlias(actual));
   }
 
-  public static Field buildAliasedField(final String alias, final Field field) {
-    return new Field(buildAliasedFieldName(alias, field.name()), field.index(), field.schema());
-  }
-
   public static String buildAliasedFieldName(final String alias, final String fieldName) {
     final String prefix = alias + FIELD_NAME_DELIMITER;
     if (fieldName.startsWith(prefix)) {
@@ -144,20 +128,11 @@ public final class SchemaUtil {
     return prefix + fieldName;
   }
 
-  public static String getJavaCastString(final Schema schema) {
-    final String castString = SCHEMA_TYPE_TO_CAST_STRING.get(schema.type());
-    if (castString == null) {
-      return "";
-    }
-
-    return castString;
-  }
-
   public static org.apache.avro.Schema buildAvroSchema(
       final PersistenceSchema schema,
       final String name
   ) {
-    return buildAvroSchema(DEFAULT_NAMESPACE, name, schema.getConnectSchema());
+    return buildAvroSchema(DEFAULT_NAMESPACE, name, schema.serializedSchema());
   }
 
   private static org.apache.avro.Schema buildAvroSchema(
@@ -229,11 +204,6 @@ public final class SchemaUtil {
 
   private static org.apache.avro.Schema unionWithNull(final org.apache.avro.Schema schema) {
     return createUnion(org.apache.avro.Schema.create(org.apache.avro.Schema.Type.NULL), schema);
-  }
-
-  public static String getFieldNameWithNoAlias(final Field field) {
-    final String name = field.name();
-    return getFieldNameWithNoAlias(name);
   }
 
   public static String getFieldNameWithNoAlias(final String fieldName) {
@@ -318,7 +288,7 @@ public final class SchemaUtil {
     return DecimalUtil.builder(precision, scale).build();
   }
 
-  public static boolean isNumber(final Schema.Type type) {
+  static boolean isNumber(final Schema.Type type) {
     return ARITHMETIC_TYPES.contains(type);
   }
 
@@ -361,6 +331,42 @@ public final class SchemaUtil {
         .name(schema.name())
         .optional()
         .build();
+  }
+
+
+  public static boolean areCompatible(final Schema arg1, final Schema arg2) {
+    if (arg2 == null) {
+      return arg1.isOptional();
+    }
+
+    // we require a custom equals method that ignores certain values (e.g.
+    // whether or not the schema is optional, and the documentation)
+    return Objects.equals(arg1.type(), arg2.type())
+        && CUSTOM_SCHEMA_EQ.getOrDefault(arg1.type(), (a, b) -> true).test(arg1, arg2)
+        && Objects.equals(arg1.version(), arg2.version())
+        && Objects.deepEquals(arg1.defaultValue(), arg2.defaultValue());
+  }
+
+  private static boolean mapEquals(final Schema mapA, final Schema mapB) {
+    return Objects.equals(mapA.keySchema(), mapB.keySchema())
+        && Objects.equals(mapA.valueSchema(), mapB.valueSchema());
+  }
+
+  private static boolean arrayEquals(final Schema arrayA, final Schema arrayB) {
+    return Objects.equals(arrayA.valueSchema(), arrayB.valueSchema());
+  }
+
+  private static boolean structEquals(final Schema structA, final Schema structB) {
+    return structA.fields().isEmpty()
+        || structB.fields().isEmpty()
+        || Objects.equals(structA.fields(), structB.fields());
+  }
+
+  private static boolean bytesEquals(final Schema bytesA, final Schema bytesB) {
+    // from a Java schema perspective, all decimals are the same
+    // since they can all be cast to BigDecimal - other bytes types
+    // are not supported in UDFs
+    return DecimalUtil.isDecimal(bytesA) && DecimalUtil.isDecimal(bytesB);
   }
 
 }

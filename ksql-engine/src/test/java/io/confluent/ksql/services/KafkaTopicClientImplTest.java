@@ -21,7 +21,6 @@ import static org.easymock.EasyMock.expectLastCall;
 import static org.easymock.EasyMock.mock;
 import static org.easymock.EasyMock.niceMock;
 import static org.easymock.EasyMock.replay;
-import static org.easymock.EasyMock.reset;
 import static org.easymock.EasyMock.verify;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -30,8 +29,10 @@ import static org.hamcrest.Matchers.is;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import io.confluent.ksql.exception.KafkaDeleteTopicsException;
 import io.confluent.ksql.exception.KafkaResponseGetFailedException;
 import io.confluent.ksql.exception.KafkaTopicExistsException;
+import io.confluent.ksql.exception.KsqlTopicAuthorizationException;
 import io.confluent.ksql.util.KsqlConstants;
 import java.util.Arrays;
 import java.util.Collection;
@@ -43,6 +44,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.AlterConfigOp;
@@ -50,6 +53,7 @@ import org.apache.kafka.clients.admin.AlterConfigOp.OpType;
 import org.apache.kafka.clients.admin.AlterConfigsResult;
 import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.ConfigEntry;
+import org.apache.kafka.clients.admin.CreateTopicsOptions;
 import org.apache.kafka.clients.admin.CreateTopicsResult;
 import org.apache.kafka.clients.admin.DeleteTopicsResult;
 import org.apache.kafka.clients.admin.DescribeClusterResult;
@@ -65,6 +69,7 @@ import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.errors.DisconnectException;
 import org.apache.kafka.common.errors.NotControllerException;
+import org.apache.kafka.common.errors.TopicAuthorizationException;
 import org.apache.kafka.common.errors.TopicDeletionDisabledException;
 import org.apache.kafka.common.errors.TopicExistsException;
 import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
@@ -114,11 +119,24 @@ public class KafkaTopicClientImplTest {
   @Test
   public void shouldCreateTopic() {
     expect(adminClient.listTopics()).andReturn(getListTopicsResult());
-    expect(adminClient.createTopics(anyObject())).andReturn(getCreateTopicsResult());
+    expect(adminClient.createTopics(anyObject(), shouldValidateCreate(false)))
+        .andReturn(getCreateTopicsResult());
     replay(adminClient);
 
     final KafkaTopicClient kafkaTopicClient = new KafkaTopicClientImpl(adminClient);
     kafkaTopicClient.createTopic("test", 1, (short) 1);
+    verify(adminClient);
+  }
+
+  @Test
+  public void shouldValidateCreateTopic() {
+    expect(adminClient.listTopics()).andReturn(getListTopicsResult());
+    expect(adminClient.createTopics(anyObject(), shouldValidateCreate(true)))
+        .andReturn(getCreateTopicsResult());
+    replay(adminClient);
+
+    final KafkaTopicClient kafkaTopicClient = new KafkaTopicClientImpl(adminClient);
+    kafkaTopicClient.validateCreateTopic("test", 1, (short) 1);
     verify(adminClient);
   }
 
@@ -153,6 +171,26 @@ public class KafkaTopicClientImplTest {
   }
 
   @Test
+  public void shouldFailCreateTopicWhenNoAclsSet() {
+    // Given:
+    expect(adminClient.listTopics()).andReturn(getEmptyListTopicResult());
+    expect(adminClient.createTopics(anyObject(), anyObject()))
+        .andReturn(createTopicAuthorizationException());
+
+    replay(adminClient);
+
+    // Expect:
+    expectedException.expect(KsqlTopicAuthorizationException.class);
+    expectedException.expectMessage(
+        String.format("Authorization denied to Create on topic(s): [%s]", topicName1));
+
+    // When:
+    final KafkaTopicClient kafkaTopicClient = new KafkaTopicClientImpl(adminClient);
+    kafkaTopicClient.createTopic(topicName1, 1, (short) 2);
+    verify(adminClient);
+  }
+
+  @Test
   public void shouldNotFailIfTopicAlreadyExistsButCreateUsesDefaultReplicas() {
     expect(adminClient.listTopics()).andReturn(getListTopicsResult());
     expect(adminClient.describeTopics(anyObject(), anyObject()))
@@ -166,7 +204,7 @@ public class KafkaTopicClientImplTest {
   @Test
   public void shouldNotFailIfTopicAlreadyExistsWhenCreating() {
     expect(adminClient.listTopics()).andReturn(getEmptyListTopicResult());
-    expect(adminClient.createTopics(anyObject()))
+    expect(adminClient.createTopics(anyObject(), anyObject()))
         .andReturn(createTopicReturningTopicExistsException());
     expect(adminClient.describeTopics(anyObject(), anyObject()))
         .andReturn(getDescribeTopicsResult());
@@ -179,7 +217,7 @@ public class KafkaTopicClientImplTest {
   @Test
   public void shouldRetryDescribeTopicOnRetriableException() {
     expect(adminClient.listTopics()).andReturn(getEmptyListTopicResult());
-    expect(adminClient.createTopics(anyObject()))
+    expect(adminClient.createTopics(anyObject(), anyObject()))
         .andReturn(createTopicReturningTopicExistsException());
     expect(adminClient.describeTopics(anyObject(), anyObject()))
         .andReturn(describeTopicReturningUnknownPartitionException()).once();
@@ -202,6 +240,26 @@ public class KafkaTopicClientImplTest {
         .andReturn(describeTopicReturningUnknownPartitionException())
         .andReturn(describeTopicReturningUnknownPartitionException());
     replay(adminClient);
+    final KafkaTopicClient kafkaTopicClient = new KafkaTopicClientImpl(adminClient);
+    kafkaTopicClient.describeTopics(Collections.singleton(topicName1));
+    verify(adminClient);
+  }
+
+  @Test
+  public void shouldFailToDescribeOnTopicAuthorizationException() {
+    // Given:
+    expect(adminClient.listTopics()).andReturn(getEmptyListTopicResult());
+    expect(adminClient.describeTopics(anyObject(), anyObject()))
+        .andReturn(describeTopicAuthorizationException());
+
+    replay(adminClient);
+
+    // Expect:
+    expectedException.expect(KsqlTopicAuthorizationException.class);
+    expectedException.expectMessage(
+        String.format("Authorization denied to Describe on topic(s): [%s]", topicName1));
+
+    // When:
     final KafkaTopicClient kafkaTopicClient = new KafkaTopicClientImpl(adminClient);
     kafkaTopicClient.describeTopics(Collections.singleton(topicName1));
     verify(adminClient);
@@ -274,15 +332,65 @@ public class KafkaTopicClientImplTest {
     verify(adminClient);
   }
 
-  @Test
-  public void shouldDeleteTopicThrowOnTopicDeletionDisabledException() {
+  @Test(expected = TopicDeletionDisabledException.class)
+  public void shouldFailToDeleteOnTopicDeletionDisabledException()
+          throws InterruptedException, ExecutionException, TimeoutException {
     // Given:
-    expect(adminClient.deleteTopics(anyObject())).andReturn(getTopicDeletionDisableException());
+    expect(adminClient.deleteTopics(anyObject())).andReturn(
+        deleteTopicException(new TopicDeletionDisabledException("error")));
     replay(adminClient);
+
     final KafkaTopicClient kafkaTopicClient = new KafkaTopicClientImpl(adminClient);
 
     // When:
-    kafkaTopicClient.deleteTopics(Collections.singletonList(topicName2));
+    kafkaTopicClient.deleteTopics(Collections.singletonList(topicName1));
+  }
+
+  @Test
+  public void shouldFailToDeleteOnTopicAuthorizationException()
+          throws InterruptedException, ExecutionException, TimeoutException {
+    // Given:
+    expect(adminClient.deleteTopics(anyObject())).andReturn(
+        (deleteTopicException(new TopicAuthorizationException("error"))));
+    replay(adminClient);
+
+    final KafkaTopicClient kafkaTopicClient = new KafkaTopicClientImpl(adminClient);
+
+    // Expect:
+    expectedException.expect(KsqlTopicAuthorizationException.class);
+    expectedException.expectMessage(
+        String.format("Authorization denied to Delete on topic(s): [%s]", topicName1));
+
+    // When:
+    kafkaTopicClient.deleteTopics(Collections.singletonList(topicName1));
+  }
+
+  @Test(expected = KafkaDeleteTopicsException.class)
+  public void shouldFailToDeleteOnKafkaDeleteTopicsException()
+          throws InterruptedException, ExecutionException, TimeoutException {
+    // Given:
+    expect(adminClient.deleteTopics(anyObject())).andReturn(
+        (deleteTopicException(new Exception("error"))));
+    replay(adminClient);
+
+    final KafkaTopicClient kafkaTopicClient = new KafkaTopicClientImpl(adminClient);
+
+    // When:
+    kafkaTopicClient.deleteTopics(Collections.singletonList(topicName1));
+  }
+
+  @Test
+  public void shouldNotThrowKafkaDeleteTopicsExceptionWhenMissingTopic()
+          throws InterruptedException, ExecutionException, TimeoutException {
+    // Given:
+    expect(adminClient.deleteTopics(anyObject())).andReturn(
+        (deleteTopicException(new UnknownTopicOrPartitionException("error"))));
+    replay(adminClient);
+
+    final KafkaTopicClient kafkaTopicClient = new KafkaTopicClientImpl(adminClient);
+
+    // When:
+    kafkaTopicClient.deleteTopics(Collections.singletonList(topicName1));
   }
 
   @Test
@@ -340,7 +448,8 @@ public class KafkaTopicClientImplTest {
     // Verify that the new topic configuration being passed to the admin client is what we expect.
     final NewTopic newTopic = new NewTopic(topicName1, 1, (short) 1);
     newTopic.configs(Collections.singletonMap("cleanup.policy", "compact"));
-    expect(adminClient.createTopics(singleNewTopic(newTopic))).andReturn(getCreateTopicsResult());
+    expect(adminClient.createTopics(singleNewTopic(newTopic), anyObject()))
+        .andReturn(getCreateTopicsResult());
     replay(adminClient);
 
     final KafkaTopicClient kafkaTopicClient = new KafkaTopicClientImpl(adminClient);
@@ -465,6 +574,14 @@ public class KafkaTopicClientImplTest {
     return describeTopicsResult;
   }
 
+  private static DescribeTopicsResult describeTopicAuthorizationException() {
+    final DescribeTopicsResult describeTopicsResult = niceMock(DescribeTopicsResult.class);
+    expect(describeTopicsResult.all())
+        .andReturn(failedFuture(new TopicAuthorizationException("error")));
+    replay(describeTopicsResult);
+    return describeTopicsResult;
+  }
+
   private DescribeTopicsResult getDescribeTopicsResult() {
     final TopicPartitionInfo topicPartitionInfo = new TopicPartitionInfo(0, node, Collections
         .singletonList(node), Collections.singletonList(node));
@@ -481,6 +598,14 @@ public class KafkaTopicClientImplTest {
     final CreateTopicsResult createTopicsResult = niceMock(CreateTopicsResult.class);
     expect(createTopicsResult.all())
         .andReturn(failedFuture(new TopicExistsException("Topic already exists")));
+    replay(createTopicsResult);
+    return createTopicsResult;
+  }
+
+  private static CreateTopicsResult createTopicAuthorizationException() {
+    final CreateTopicsResult createTopicsResult = niceMock(CreateTopicsResult.class);
+    expect(createTopicsResult.all()).andReturn(failedFuture(
+        new TopicAuthorizationException("error")));
     replay(createTopicsResult);
     return createTopicsResult;
   }
@@ -559,17 +684,15 @@ public class KafkaTopicClientImplTest {
     return Collections.singleton(new ConfigResource(ConfigResource.Type.BROKER, node.idString()));
   }
 
-  private DeleteTopicsResult getTopicDeletionDisableException() {
+  private static DeleteTopicsResult deleteTopicException(Exception e)
+          throws InterruptedException, ExecutionException, TimeoutException {
     final DeleteTopicsResult deleteTopicsResult = mock(DeleteTopicsResult.class);
     final KafkaFuture<Void> kafkaFuture = mock(KafkaFuture.class);
 
-    try {
-      expect(kafkaFuture.get()).andThrow(
-          new TopicDeletionDisabledException("Topic deletion is disabled")
-      );
-    } catch (final Exception e) {
-      // this should not happen in the test
-    }
+    expect(kafkaFuture.get(30, TimeUnit.SECONDS)).andThrow(
+        new ExecutionException(e)
+    );
+    replay(kafkaFuture);
 
     expect(deleteTopicsResult.values())
         .andReturn(Collections.singletonMap(topicName1, kafkaFuture));
@@ -719,6 +842,23 @@ public class KafkaTopicClientImplTest {
     }
 
     EasyMock.reportMatcher(new NewTopicsMatcher());
+    return null;
+  }
+
+  private CreateTopicsOptions shouldValidateCreate(final boolean validateOnly) {
+    EasyMock.reportMatcher(new IArgumentMatcher() {
+      @Override
+      public boolean matches(Object argument) {
+        return argument instanceof CreateTopicsOptions
+            && ((CreateTopicsOptions) argument).shouldValidateOnly() == validateOnly;
+      }
+
+      @Override
+      public void appendTo(StringBuffer buffer) {
+        buffer.append("validateOnly(\"" + validateOnly + "\")");
+      }
+    });
+
     return null;
   }
 }

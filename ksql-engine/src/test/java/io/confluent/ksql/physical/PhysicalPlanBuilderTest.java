@@ -233,7 +233,7 @@ public class PhysicalPlanBuilderTest {
   }
 
   private QueryMetadata buildPhysicalPlan(final String query) {
-    final OutputNode logical = AnalysisTestUtil.buildLogicalPlan(query, metaStore);;
+    final OutputNode logical = AnalysisTestUtil.buildLogicalPlan(ksqlConfig, query, metaStore);;
     return physicalPlanBuilder.buildPhysicalPlan(new LogicalPlanNode(query, Optional.of(logical)));
   }
 
@@ -364,11 +364,11 @@ public class PhysicalPlanBuilderTest {
     Assert.assertEquals(lines[1],
         "\t\t > [ PROJECT ] | Schema: [ROWKEY STRING KEY, COL0 BIGINT, COL1 STRING, COL2 DOUBLE] | Logger: InsertQuery_1.Project");
     Assert.assertEquals(lines[2],
-        "\t\t\t\t > [ SOURCE ] | Schema: [TEST1.ROWKEY STRING KEY, TEST1.ROWTIME BIGINT, TEST1.ROWKEY STRING, TEST1.COL0 BIGINT, TEST1.COL1 STRING, TEST1.COL2 DOUBLE] | Logger: InsertQuery_1.KsqlTopic");
+        "\t\t\t\t > [ SOURCE ] | Schema: [TEST1.ROWKEY STRING KEY, TEST1.ROWTIME BIGINT, TEST1.ROWKEY STRING, TEST1.COL0 BIGINT, TEST1.COL1 STRING, TEST1.COL2 DOUBLE] | Logger: InsertQuery_1.KsqlTopic.source");
     assertThat(queryMetadataList.get(1), instanceOf(PersistentQueryMetadata.class));
     final PersistentQueryMetadata persistentQuery = (PersistentQueryMetadata)
         queryMetadataList.get(1);
-    assertThat(persistentQuery.getResultTopic().getValueSerdeFactory().getFormat(),
+    assertThat(persistentQuery.getResultTopic().getValueFormat().getFormat(),
         equalTo(Format.DELIMITED));
   }
 
@@ -685,7 +685,7 @@ public class PhysicalPlanBuilderTest {
     final ProcessingLogger logger = mock(ProcessingLogger.class);
     when(processingLogContext.getLoggerFactory()).thenReturn(loggerFactory);
     final OutputNode spyNode = spy(
-        AnalysisTestUtil.buildLogicalPlan(simpleSelectFilter, metaStore));
+        AnalysisTestUtil.buildLogicalPlan(ksqlConfig, simpleSelectFilter, metaStore));
     doReturn(new QueryId("foo")).when(spyNode).getQueryId(any());
     when(loggerFactory.getLogger("foo")).thenReturn(logger);
     when(loggerFactory.getLogger(ArgumentMatchers.startsWith("foo.")))

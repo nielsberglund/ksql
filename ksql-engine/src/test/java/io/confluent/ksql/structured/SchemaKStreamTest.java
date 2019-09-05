@@ -23,6 +23,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.nullValue;
 import static org.junit.Assert.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -35,6 +36,13 @@ import static org.mockito.Mockito.when;
 import com.google.common.collect.ImmutableList;
 import io.confluent.kafka.schemaregistry.client.MockSchemaRegistryClient;
 import io.confluent.ksql.GenericRow;
+import io.confluent.ksql.execution.context.QueryContext;
+import io.confluent.ksql.execution.expression.tree.DereferenceExpression;
+import io.confluent.ksql.execution.expression.tree.Expression;
+import io.confluent.ksql.execution.expression.tree.FunctionCall;
+import io.confluent.ksql.execution.expression.tree.QualifiedName;
+import io.confluent.ksql.execution.expression.tree.QualifiedNameReference;
+import io.confluent.ksql.execution.plan.SelectExpression;
 import io.confluent.ksql.function.InternalFunctionRegistry;
 import io.confluent.ksql.logging.processing.ProcessingLogContext;
 import io.confluent.ksql.metastore.MetaStore;
@@ -45,22 +53,18 @@ import io.confluent.ksql.metastore.model.KsqlTable;
 import io.confluent.ksql.metastore.model.KsqlTopic;
 import io.confluent.ksql.metastore.model.MetaStoreMatchers.KeyFieldMatchers;
 import io.confluent.ksql.metastore.model.MetaStoreMatchers.OptionalMatchers;
-import io.confluent.ksql.parser.tree.DereferenceExpression;
-import io.confluent.ksql.parser.tree.Expression;
-import io.confluent.ksql.parser.tree.FunctionCall;
-import io.confluent.ksql.parser.tree.QualifiedName;
-import io.confluent.ksql.parser.tree.QualifiedNameReference;
 import io.confluent.ksql.planner.plan.FilterNode;
 import io.confluent.ksql.planner.plan.PlanNode;
 import io.confluent.ksql.planner.plan.ProjectNode;
 import io.confluent.ksql.query.QueryId;
 import io.confluent.ksql.schema.ksql.Field;
 import io.confluent.ksql.schema.ksql.LogicalSchema;
-import io.confluent.ksql.schema.ksql.PhysicalSchema;
+import io.confluent.ksql.schema.ksql.PersistenceSchema;
 import io.confluent.ksql.schema.ksql.types.SqlTypes;
+import io.confluent.ksql.serde.Format;
+import io.confluent.ksql.serde.FormatInfo;
 import io.confluent.ksql.serde.GenericRowSerDe;
-import io.confluent.ksql.serde.SerdeOption;
-import io.confluent.ksql.serde.json.KsqlJsonSerdeFactory;
+import io.confluent.ksql.serde.KeySerde;
 import io.confluent.ksql.streams.GroupedFactory;
 import io.confluent.ksql.streams.JoinedFactory;
 import io.confluent.ksql.streams.MaterializedFactory;
@@ -71,7 +75,6 @@ import io.confluent.ksql.testutils.AnalysisTestUtil;
 import io.confluent.ksql.util.KsqlConfig;
 import io.confluent.ksql.util.MetaStoreFixture;
 import io.confluent.ksql.util.SchemaUtil;
-import io.confluent.ksql.util.SelectExpression;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -80,23 +83,30 @@ import java.util.List;
 import java.util.Optional;
 import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.serialization.Serdes;
-import org.apache.kafka.common.serialization.Serdes.StringSerde;
+import org.apache.kafka.connect.data.ConnectSchema;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.kstream.Aggregator;
 import org.apache.kafka.streams.kstream.Consumed;
 import org.apache.kafka.streams.kstream.Grouped;
+import org.apache.kafka.streams.kstream.Initializer;
 import org.apache.kafka.streams.kstream.JoinWindows;
 import org.apache.kafka.streams.kstream.Joined;
 import org.apache.kafka.streams.kstream.KGroupedStream;
 import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.KTable;
 import org.apache.kafka.streams.kstream.KeyValueMapper;
+import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Predicate;
+import org.apache.kafka.streams.kstream.ValueMapper;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
+import org.mockito.Mockito;
 import org.mockito.junit.MockitoJUnitRunner;
 
 @SuppressWarnings({"unchecked", "OptionalGetWithoutIsPresent"})
@@ -148,7 +158,15 @@ public class SchemaKStreamTest {
   @Mock
   private JoinedFactory mockJoinedFactory;
   @Mock
+  private MaterializedFactory mockMaterializedFactory;
+  @Mock
+  private Materialized mockMaterialized;
+  @Mock
   private KStream mockKStream;
+  @Mock
+  private KeySerde keySerde;
+  @Mock
+  private KeySerde reboundKeySerde;
 
   @Before
   public void init() {
@@ -162,8 +180,9 @@ public class SchemaKStreamTest {
           getRowSerde(ksqlStream.getKsqlTopic(), ksqlStream.getSchema().valueSchema())
         ));
 
-    when(mockGroupedFactory.create(anyString(), any(StringSerde.class), any(Serde.class)))
+    when(mockGroupedFactory.create(anyString(), any(Serde.class), any(Serde.class)))
         .thenReturn(grouped);
+    when(mockMaterializedFactory.create(any(), any(), anyString())).thenReturn(mockMaterialized);
 
     final KsqlStream secondKsqlStream = (KsqlStream) metaStore.getSource("ORDERS");
     final KStream secondKStream = builder
@@ -186,11 +205,10 @@ public class SchemaKStreamTest {
     rightSerde = getRowSerde(secondKsqlStream.getKsqlTopic(), secondKsqlStream.getSchema().valueSchema());
 
     schemaKTable = new SchemaKTable<>(
-        ksqlTable.getSchema(),
-        kTable,
+        kTable, ksqlTable.getSchema(),
+        keySerde,
         ksqlTable.getKeyField(),
         new ArrayList<>(),
-        Serdes::String,
         SchemaKStream.Type.SOURCE,
         ksqlConfig,
         functionRegistry,
@@ -198,13 +216,15 @@ public class SchemaKStreamTest {
 
     joinSchema = getJoinSchema(ksqlStream.getSchema(), secondKsqlStream.getSchema());
 
+    when(keySerde.rebind(any(PersistenceSchema.class))).thenReturn(reboundKeySerde);
+
     whenCreateJoined();
   }
 
   private static Serde<GenericRow> getRowSerde(final KsqlTopic topic, final Schema schema) {
     return GenericRowSerDe.from(
-        topic.getValueSerdeFactory(),
-        PhysicalSchema.from(LogicalSchema.of(schema), SerdeOption.none()),
+        topic.getValueFormat().getFormatInfo(),
+        PersistenceSchema.from((ConnectSchema)schema, false),
         new KsqlConfig(Collections.emptyMap()),
         MockSchemaRegistryClient::new,
         "test",
@@ -420,6 +440,7 @@ public class SchemaKStreamTest {
 
     // Then:
     assertThat(rekeyedSchemaKStream.getKeyField(), is(expected));
+    assertThat(rekeyedSchemaKStream.getKeySerde(), is(reboundKeySerde));
   }
 
   @Test(expected = IllegalArgumentException.class)
@@ -516,7 +537,7 @@ public class SchemaKStreamTest {
     // Then:
     verify(mockGroupedFactory).create(
         eq(StreamsUtil.buildOpName(childContextStacker.getQueryContext())),
-        any(StringSerde.class),
+        same(keySerde),
         same(leftSerde)
     );
     verify(mockKStream).groupByKey(same(grouped));
@@ -545,9 +566,76 @@ public class SchemaKStreamTest {
     // Then:
     verify(mockGroupedFactory).create(
         eq(StreamsUtil.buildOpName(childContextStacker.getQueryContext())),
-        any(StringSerde.class),
+        same(reboundKeySerde),
         same(leftSerde));
     verify(mockKStream).groupBy(any(KeyValueMapper.class), same(grouped));
+  }
+
+  @Test
+  public void shouldConvertToTableWithCorrectProperties() {
+    // Given:
+    givenInitialSchemaKStreamUsesMocks();
+    when(mockKStream.mapValues(any(ValueMapper.class))).thenReturn(mockKStream);
+    final KGroupedStream groupedStream = mock(KGroupedStream.class);
+    final KTable table = mock(KTable.class);
+    when(mockKStream.groupByKey()).thenReturn(groupedStream);
+    when(groupedStream.aggregate(any(), any(), any())).thenReturn(table);
+
+    // When:
+    final SchemaKTable result = initialSchemaKStream.toTable(leftSerde, childContextStacker);
+
+    // Then:
+    assertThat(result.getSchema(), is(initialSchemaKStream.getSchema()));
+    assertThat(result.getKeyField(), is(initialSchemaKStream.getKeyField()));
+    assertThat(result.getKeySerde(), is(initialSchemaKStream.getKeySerde()));
+    assertThat(result.getKtable(), is(table));
+  }
+
+  @Test
+  public void shouldConvertToOptionalBeforeGroupingInToTable() {
+    // Given:
+    givenInitialSchemaKStreamUsesMocks();
+    when(mockKStream.mapValues(any(ValueMapper.class))).thenReturn(mockKStream);
+    final KGroupedStream groupedStream = mock(KGroupedStream.class);
+    final KTable table = mock(KTable.class);
+    when(mockKStream.groupByKey()).thenReturn(groupedStream);
+    when(groupedStream.aggregate(any(), any(), any())).thenReturn(table);
+
+    // When:
+    initialSchemaKStream.toTable(leftSerde, childContextStacker);
+
+    // Then:
+    InOrder inOrder = Mockito.inOrder(mockKStream);
+    final ArgumentCaptor<ValueMapper> captor = ArgumentCaptor.forClass(ValueMapper.class);
+    inOrder.verify(mockKStream).mapValues(captor.capture());
+    inOrder.verify(mockKStream).groupByKey();
+    assertThat(captor.getValue().apply(null), equalTo(Optional.empty()));
+    final GenericRow nonNull = new GenericRow(1, 2, 3);
+    assertThat(captor.getValue().apply(nonNull), equalTo(Optional.of(nonNull)));
+  }
+
+  @Test
+  public void shouldComputeAggregateCorrectlyInToTable() {
+    // Given:
+    givenInitialSchemaKStreamUsesMocks();
+    when(mockKStream.mapValues(any(ValueMapper.class))).thenReturn(mockKStream);
+    final KGroupedStream groupedStream = mock(KGroupedStream.class);
+    final KTable table = mock(KTable.class);
+    when(mockKStream.groupByKey()).thenReturn(groupedStream);
+    when(groupedStream.aggregate(any(), any(), any())).thenReturn(table);
+
+    // When:
+    initialSchemaKStream.toTable(leftSerde, childContextStacker);
+
+    // Then:
+    final ArgumentCaptor<Initializer> initCaptor = ArgumentCaptor.forClass(Initializer.class);
+    final ArgumentCaptor<Aggregator> captor = ArgumentCaptor.forClass(Aggregator.class);
+    verify(groupedStream)
+        .aggregate(initCaptor.capture(), captor.capture(), same(mockMaterialized));
+    assertThat(initCaptor.getValue().apply(), is(nullValue()));
+    assertThat(captor.getValue().apply(null, Optional.empty(), null), is(nullValue()));
+    final GenericRow nonNull = new GenericRow(1, 2, 3);
+    assertThat(captor.getValue().apply(null, Optional.of(nonNull), null), is(nonNull));
   }
 
   @SuppressWarnings("unchecked")
@@ -755,11 +843,11 @@ public class SchemaKStreamTest {
     when(parentSchemaKStream.getExecutionPlan(anyString()))
         .thenReturn("parent plan");
     final SchemaKStream schemaKtream = new SchemaKStream(
-        simpleSchema,
         mock(KStream.class),
+        simpleSchema,
+        keySerde,
         KeyField.of("key", simpleSchema.findValueField("key").get()),
         ImmutableList.of(parentSchemaKStream),
-        Serdes::String,
         Type.SOURCE,
         ksqlConfig,
         functionRegistry,
@@ -776,11 +864,11 @@ public class SchemaKStreamTest {
   public void shouldSummarizeExecutionPlanCorrectlyForRoot() {
     // Given:
     final SchemaKStream schemaKtream = new SchemaKStream(
-        simpleSchema,
         mock(KStream.class),
+        simpleSchema,
+        keySerde,
         KeyField.of("key", simpleSchema.findValueField("key").get()),
         Collections.emptyList(),
-        Serdes::String,
         Type.SOURCE,
         ksqlConfig,
         functionRegistry,
@@ -802,11 +890,11 @@ public class SchemaKStreamTest {
     when(parentSchemaKStream2.getExecutionPlan(anyString()))
         .thenReturn("parent 2 plan");
     final SchemaKStream schemaKtream = new SchemaKStream(
-        simpleSchema,
         mock(KStream.class),
+        simpleSchema,
+        keySerde,
         KeyField.of("key", simpleSchema.findValueField("key").get()),
         ImmutableList.of(parentSchemaKStream1, parentSchemaKStream2),
-        Serdes::String,
         Type.SOURCE,
         ksqlConfig,
         functionRegistry,
@@ -823,7 +911,7 @@ public class SchemaKStreamTest {
   private void whenCreateJoined() {
     when(
         mockJoinedFactory.create(
-            any(StringSerde.class),
+            any(Serde.class),
             any(Serde.class),
             any(),
             anyString())
@@ -832,7 +920,7 @@ public class SchemaKStreamTest {
 
   private void verifyCreateJoined(final Serde<GenericRow> rightSerde) {
     verify(mockJoinedFactory).create(
-        any(StringSerde.class),
+        same(keySerde),
         same(leftSerde),
         same(rightSerde),
         eq(StreamsUtil.buildOpName(childContextStacker.getQueryContext()))
@@ -845,11 +933,11 @@ public class SchemaKStreamTest {
       final KStream kStream,
       final StreamsFactories streamsFactories) {
     return new SchemaKStream(
-        schema,
         kStream,
+        schema,
+        keySerde,
         keyField,
         new ArrayList<>(),
-        Serdes::String,
         Type.SOURCE,
         ksqlConfig,
         functionRegistry,
@@ -869,7 +957,7 @@ public class SchemaKStreamTest {
         schema,
         keyFieldWithAlias,
         mockKStream,
-        new StreamsFactories(mockGroupedFactory, mockJoinedFactory, mock(MaterializedFactory.class))
+        new StreamsFactories(mockGroupedFactory, mockJoinedFactory, mockMaterializedFactory)
     );
   }
 
@@ -913,22 +1001,26 @@ public class SchemaKStreamTest {
   }
 
   private PlanNode givenInitialKStreamOf(final String selectQuery) {
-    final PlanNode logicalPlan = AnalysisTestUtil.buildLogicalPlan(selectQuery, metaStore);
+    final PlanNode logicalPlan = AnalysisTestUtil.buildLogicalPlan(
+        ksqlConfig,
+        selectQuery,
+        metaStore
+    );
 
     initialSchemaKStream = new SchemaKStream(
-        logicalPlan.getTheSourceNode().getSchema(),
         kStream,
+        logicalPlan.getTheSourceNode().getSchema(),
+        keySerde,
         logicalPlan.getTheSourceNode().getKeyField(),
         new ArrayList<>(),
-        Serdes::String,
         SchemaKStream.Type.SOURCE,
         ksqlConfig,
         functionRegistry,
         queryContext.push("source").getQueryContext());
 
     rowSerde = GenericRowSerDe.from(
-        new KsqlJsonSerdeFactory(),
-        PhysicalSchema.from(initialSchemaKStream.getSchema(), SerdeOption.none()),
+        FormatInfo.of(Format.JSON, Optional.empty()),
+        PersistenceSchema.from(initialSchemaKStream.getSchema().valueSchema(), false),
         null,
         () -> null,
         "test",

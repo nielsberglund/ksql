@@ -16,66 +16,41 @@
 package io.confluent.ksql.services;
 
 import io.confluent.kafka.schemaregistry.client.SchemaRegistryClient;
-import io.confluent.ksql.schema.registry.KsqlSchemaRegistryClientFactory;
 import io.confluent.ksql.util.KsqlConfig;
-import java.util.Collections;
 import java.util.Objects;
 import java.util.function.Supplier;
-import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.streams.KafkaClientSupplier;
-import org.apache.kafka.streams.processor.internals.DefaultKafkaClientSupplier;
 
 /**
  * A real service context, initialized from a {@link KsqlConfig} instance.
  */
-public class DefaultServiceContext implements ServiceContext {
+public class DefaultServiceContext implements ServiceContext, AutoCloseable {
 
   private final KafkaClientSupplier kafkaClientSupplier;
-  private final AdminClient adminClient;
+  private final Admin adminClient;
   private final KafkaTopicClient topicClient;
   private final Supplier<SchemaRegistryClient> srClientFactory;
   private final SchemaRegistryClient srClient;
-
-  public static DefaultServiceContext create(final KsqlConfig ksqlConfig) {
-    return create(
-        ksqlConfig,
-        new DefaultKafkaClientSupplier(),
-        new KsqlSchemaRegistryClientFactory(ksqlConfig, Collections.emptyMap())::get
-    );
-  }
-
-  public static DefaultServiceContext create(
-      final KsqlConfig ksqlConfig,
-      final KafkaClientSupplier kafkaClientSupplier,
-      final Supplier<SchemaRegistryClient> srClientFactory
-  ) {
-    final AdminClient adminClient = kafkaClientSupplier.getAdminClient(
-        ksqlConfig.getKsqlAdminClientConfigProps()
-    );
-
-    return new DefaultServiceContext(
-        kafkaClientSupplier,
-        adminClient,
-        new KafkaTopicClientImpl(adminClient),
-        srClientFactory
-    );
-  }
+  private final ConnectClient connectClient;
 
   DefaultServiceContext(
       final KafkaClientSupplier kafkaClientSupplier,
-      final AdminClient adminClient,
+      final Admin adminClient,
       final KafkaTopicClient topicClient,
-      final Supplier<SchemaRegistryClient> srClientFactory
+      final Supplier<SchemaRegistryClient> srClientFactory,
+      final ConnectClient connectClient
   ) {
     this.kafkaClientSupplier = Objects.requireNonNull(kafkaClientSupplier, "kafkaClientSupplier");
     this.adminClient = Objects.requireNonNull(adminClient, "adminClient");
     this.topicClient = Objects.requireNonNull(topicClient, "topicClient");
     this.srClientFactory = Objects.requireNonNull(srClientFactory, "srClientFactory");
     this.srClient = Objects.requireNonNull(srClientFactory.get(), "srClient");
+    this.connectClient = Objects.requireNonNull(connectClient, "connectClient");
   }
 
   @Override
-  public AdminClient getAdminClient() {
+  public Admin getAdminClient() {
     return adminClient;
   }
 
@@ -97,6 +72,11 @@ public class DefaultServiceContext implements ServiceContext {
   @Override
   public Supplier<SchemaRegistryClient> getSchemaRegistryClientFactory() {
     return srClientFactory;
+  }
+
+  @Override
+  public ConnectClient getConnectClient() {
+    return connectClient;
   }
 
   @Override

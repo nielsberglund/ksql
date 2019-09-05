@@ -32,9 +32,9 @@ import io.confluent.ksql.rest.entity.SourceInfo;
 import io.confluent.ksql.rest.entity.StreamsList;
 import io.confluent.ksql.rest.entity.TablesList;
 import io.confluent.ksql.rest.server.context.KsqlRestServiceContextBinder;
-import io.confluent.ksql.rest.server.security.KsqlSecurityExtension;
-import io.confluent.ksql.services.DefaultServiceContext;
+import io.confluent.ksql.security.KsqlSecurityExtension;
 import io.confluent.ksql.services.ServiceContext;
+import io.confluent.ksql.services.ServiceContextFactory;
 import io.confluent.ksql.test.util.EmbeddedSingleNodeKafkaCluster;
 import io.confluent.ksql.util.KsqlConfig;
 import io.confluent.ksql.version.metrics.VersionCheckerAgent;
@@ -51,6 +51,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -58,12 +59,14 @@ import javax.ws.rs.client.Client;
 import javax.ws.rs.client.ClientBuilder;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.eclipse.jetty.websocket.api.util.WSURI;
+import org.glassfish.hk2.api.Factory;
 import org.glassfish.hk2.utilities.Binder;
+import org.glassfish.hk2.utilities.binding.AbstractBinder;
+import org.glassfish.jersey.process.internal.RequestScoped;
 import org.junit.rules.ExternalResource;
 
 /**
- * Junit external resource for managing an instance of
- * {@link io.confluent.ksql.rest.server.KsqlRestApplication}.
+ * Junit external resource for managing an instance of {@link KsqlRestApplication}.
  *
  * Generally used in conjunction with {@link EmbeddedSingleNodeKafkaCluster}
  *
@@ -80,6 +83,9 @@ import org.junit.rules.ExternalResource;
  */
 public class TestKsqlRestApp extends ExternalResource {
 
+  private static final AtomicInteger COUNTER = new AtomicInteger();
+
+  private final String metricsPrefix = "app-" + COUNTER.getAndIncrement() + "-";
   private final Map<String, ?> baseConfig;
   private final Supplier<String> bootstrapServers;
   private final Supplier<ServiceContext> serviceContext;
@@ -91,8 +97,8 @@ public class TestKsqlRestApp extends ExternalResource {
       final Supplier<String> bootstrapServers,
       final Map<String, Object> additionalProps,
       final Supplier<ServiceContext> serviceContext,
-      final BiFunction<KsqlConfig, KsqlSecurityExtension, Binder>  serviceContextBinderFactory) {
-
+      final BiFunction<KsqlConfig, KsqlSecurityExtension, Binder> serviceContextBinderFactory
+  ) {
     this.baseConfig = buildBaseConfig(additionalProps);
     this.bootstrapServers = Objects.requireNonNull(bootstrapServers, "bootstrapServers");
     this.serviceContext = Objects.requireNonNull(serviceContext, "serviceContext");
@@ -100,10 +106,12 @@ public class TestKsqlRestApp extends ExternalResource {
         .requireNonNull(serviceContextBinderFactory, "serviceContextBinderFactory");
   }
 
+  @SuppressWarnings("WeakerAccess") // Part of public API
   public List<URL> getListeners() {
     return this.listeners;
   }
 
+  @SuppressWarnings("unused") // Part of public API
   public Map<String, ?> getBaseConfig() {
     return Collections.unmodifiableMap(this.baseConfig);
   }
@@ -201,6 +209,7 @@ public class TestKsqlRestApp extends ExternalResource {
 
     try {
       restServer = KsqlRestApplication.buildApplication(
+          metricsPrefix,
           buildConfig(bootstrapServers, baseConfig),
           (booleanSupplier) -> niceMock(VersionCheckerAgent.class),
           3,
@@ -362,7 +371,7 @@ public class TestKsqlRestApp extends ExternalResource {
       final Supplier<String> bootstrapServers,
       final Map<String, ?> baseConfig) {
 
-    return DefaultServiceContext.create(
+    return ServiceContextFactory.create(
         new KsqlConfig(buildConfig(bootstrapServers, baseConfig).getKsqlConfigProperties()));
   }
 
@@ -394,15 +403,29 @@ public class TestKsqlRestApp extends ExternalResource {
       return this;
     }
 
-    public Builder withServiceContext(final Supplier<ServiceContext> serviceContext) {
+    public Builder withStaticServiceContext(final Supplier<ServiceContext> serviceContext) {
       this.serviceContext = serviceContext;
-      return this;
-    }
+      this.serviceContextBinder = (config, extension) -> new AbstractBinder() {
+        @Override
+        protected void configure() {
+          final Factory<ServiceContext> factory = new Factory<ServiceContext>() {
+            @Override
+            public ServiceContext provide() {
+              return serviceContext.get();
+            }
 
-    public Builder withServiceContextBinder(
-        final BiFunction<KsqlConfig, KsqlSecurityExtension, Binder>  binder
-    ) {
-      serviceContextBinder = binder;
+            @Override
+            public void dispose(final ServiceContext serviceContext) {
+              // do nothing because context is shared
+            }
+          };
+
+          bindFactory(factory)
+              .to(ServiceContext.class)
+              .in(RequestScoped.class);
+        }
+      };
+
       return this;
     }
 
@@ -411,7 +434,8 @@ public class TestKsqlRestApp extends ExternalResource {
           bootstrapServers,
           additionalProps,
           serviceContext,
-          serviceContextBinder);
+          serviceContextBinder
+      );
     }
   }
 }

@@ -19,6 +19,8 @@ import static com.google.common.base.MoreObjects.toStringHelper;
 import static java.util.Objects.requireNonNull;
 
 import com.google.errorprone.annotations.Immutable;
+import io.confluent.ksql.execution.expression.tree.Expression;
+import io.confluent.ksql.parser.NodeLocation;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
@@ -33,18 +35,6 @@ public class Query extends Statement {
   private final Optional<GroupBy> groupBy;
   private final Optional<Expression> having;
   private final OptionalInt limit;
-
-  public Query(
-      final Select select,
-      final Relation from,
-      final Optional<WindowExpression> window,
-      final Optional<Expression> where,
-      final Optional<GroupBy> groupBy,
-      final Optional<Expression> having,
-      final OptionalInt limit
-  ) {
-    this(Optional.empty(), select, from, window, where, groupBy, having, limit);
-  }
 
   public Query(
       final Optional<NodeLocation> location,

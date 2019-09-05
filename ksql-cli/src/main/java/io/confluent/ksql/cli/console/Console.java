@@ -27,6 +27,10 @@ import io.confluent.ksql.cli.console.cmd.CliSpecificCommand;
 import io.confluent.ksql.cli.console.table.Table;
 import io.confluent.ksql.cli.console.table.Table.Builder;
 import io.confluent.ksql.cli.console.table.builder.CommandStatusTableBuilder;
+import io.confluent.ksql.cli.console.table.builder.ConnectorInfoTableBuilder;
+import io.confluent.ksql.cli.console.table.builder.ConnectorListTableBuilder;
+import io.confluent.ksql.cli.console.table.builder.DropConnectorTableBuilder;
+import io.confluent.ksql.cli.console.table.builder.ErrorEntityTableBuilder;
 import io.confluent.ksql.cli.console.table.builder.ExecutionPlanTableBuilder;
 import io.confluent.ksql.cli.console.table.builder.FunctionNameListTableBuilder;
 import io.confluent.ksql.cli.console.table.builder.KafkaTopicsListTableBuilder;
@@ -36,15 +40,22 @@ import io.confluent.ksql.cli.console.table.builder.StreamsListTableBuilder;
 import io.confluent.ksql.cli.console.table.builder.TableBuilder;
 import io.confluent.ksql.cli.console.table.builder.TablesListTableBuilder;
 import io.confluent.ksql.cli.console.table.builder.TopicDescriptionTableBuilder;
+import io.confluent.ksql.cli.console.table.builder.TypeListTableBuilder;
 import io.confluent.ksql.json.JsonMapper;
 import io.confluent.ksql.rest.entity.ArgumentInfo;
 import io.confluent.ksql.rest.entity.CommandStatusEntity;
+import io.confluent.ksql.rest.entity.ConnectorDescription;
+import io.confluent.ksql.rest.entity.ConnectorList;
+import io.confluent.ksql.rest.entity.CreateConnectorEntity;
+import io.confluent.ksql.rest.entity.DropConnectorEntity;
+import io.confluent.ksql.rest.entity.ErrorEntity;
 import io.confluent.ksql.rest.entity.ExecutionPlan;
 import io.confluent.ksql.rest.entity.FieldInfo;
 import io.confluent.ksql.rest.entity.FunctionDescriptionList;
 import io.confluent.ksql.rest.entity.FunctionInfo;
 import io.confluent.ksql.rest.entity.FunctionNameList;
 import io.confluent.ksql.rest.entity.KafkaTopicsList;
+import io.confluent.ksql.rest.entity.KafkaTopicsListExtended;
 import io.confluent.ksql.rest.entity.KsqlEntity;
 import io.confluent.ksql.rest.entity.KsqlEntityList;
 import io.confluent.ksql.rest.entity.KsqlErrorMessage;
@@ -56,7 +67,6 @@ import io.confluent.ksql.rest.entity.QueryDescription;
 import io.confluent.ksql.rest.entity.QueryDescriptionEntity;
 import io.confluent.ksql.rest.entity.QueryDescriptionList;
 import io.confluent.ksql.rest.entity.RunningQuery;
-import io.confluent.ksql.rest.entity.SchemaInfo;
 import io.confluent.ksql.rest.entity.SourceDescription;
 import io.confluent.ksql.rest.entity.SourceDescriptionEntity;
 import io.confluent.ksql.rest.entity.SourceDescriptionList;
@@ -64,7 +74,7 @@ import io.confluent.ksql.rest.entity.StreamedRow;
 import io.confluent.ksql.rest.entity.StreamsList;
 import io.confluent.ksql.rest.entity.TablesList;
 import io.confluent.ksql.rest.entity.TopicDescription;
-import io.confluent.ksql.schema.ksql.SqlBaseType;
+import io.confluent.ksql.rest.entity.TypeList;
 import io.confluent.ksql.util.CmdLineUtil;
 import io.confluent.ksql.util.HandlerMaps;
 import io.confluent.ksql.util.HandlerMaps.ClassHandlerMap1;
@@ -91,7 +101,9 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
+import org.apache.commons.lang3.ObjectUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.kafka.connect.runtime.rest.entities.ConnectorStateInfo;
 import org.jline.terminal.Terminal.Signal;
 import org.jline.terminal.Terminal.SignalHandler;
 import org.slf4j.Logger;
@@ -126,13 +138,29 @@ public class Console implements Closeable {
           .put(TablesList.class,
               tablePrinter(TablesList.class, TablesListTableBuilder::new))
           .put(KafkaTopicsList.class,
-              tablePrinter(KafkaTopicsList.class, KafkaTopicsListTableBuilder::new))
+              tablePrinter(KafkaTopicsList.class, KafkaTopicsListTableBuilder.SimpleBuilder::new))
+          .put(KafkaTopicsListExtended.class,
+              tablePrinter(
+                  KafkaTopicsListExtended.class,
+                  KafkaTopicsListTableBuilder.ExtendedBuilder::new))
           .put(ExecutionPlan.class,
               tablePrinter(ExecutionPlan.class, ExecutionPlanTableBuilder::new))
           .put(FunctionNameList.class,
               tablePrinter(FunctionNameList.class, FunctionNameListTableBuilder::new))
           .put(FunctionDescriptionList.class,
               Console::printFunctionDescription)
+          .put(CreateConnectorEntity.class,
+              tablePrinter(CreateConnectorEntity.class, ConnectorInfoTableBuilder::new))
+          .put(DropConnectorEntity.class,
+              tablePrinter(DropConnectorEntity.class, DropConnectorTableBuilder::new))
+          .put(ConnectorList.class,
+              tablePrinter(ConnectorList.class, ConnectorListTableBuilder::new))
+          .put(ConnectorDescription.class,
+              Console::printConnectorDescription)
+          .put(TypeList.class,
+              tablePrinter(TypeList.class, TypeListTableBuilder::new))
+          .put(ErrorEntity.class,
+              tablePrinter(ErrorEntity.class, ErrorEntityTableBuilder::new))
           .build();
 
   private static <T extends KsqlEntity> Handler1<KsqlEntity, Console> tablePrinter(
@@ -414,39 +442,13 @@ public class Console implements Closeable {
     }
   }
 
-  @SuppressWarnings("ConstantConditions")
-  private static String schemaToTypeString(final SchemaInfo schema) {
-    switch (schema.getType()) {
-      case ARRAY:
-        return SqlBaseType.ARRAY + "<"
-            + schemaToTypeString(schema.getMemberSchema().get())
-            + ">";
-      case MAP:
-        return SqlBaseType.MAP
-            + "<"
-            + SqlBaseType.STRING + ", "
-            + schemaToTypeString(schema.getMemberSchema().get())
-            + ">";
-      case STRUCT:
-        return schema.getFields().get()
-            .stream()
-            .map(f -> f.getName() + " " + schemaToTypeString(f.getSchema()))
-            .collect(Collectors.joining(", ", SqlBaseType.STRUCT + "<", ">"));
-      case STRING:
-        return "VARCHAR(STRING)";
-      default:
-        return schema.getType().name();
-    }
-  }
-
   private static String formatFieldType(final FieldInfo field, final String keyField) {
-
     if (field.getName().equals("ROWTIME") || field.getName().equals("ROWKEY")) {
-      return String.format("%-16s %s", schemaToTypeString(field.getSchema()), "(system)");
+      return String.format("%-16s %s", field.getSchema().toTypeString(), "(system)");
     } else if (keyField != null && keyField.contains("." + field.getName())) {
-      return String.format("%-16s %s", schemaToTypeString(field.getSchema()), "(key)");
+      return String.format("%-16s %s", field.getSchema().toTypeString(), "(key)");
     } else {
-      return schemaToTypeString(field.getSchema());
+      return field.getSchema().toTypeString();
     }
   }
 
@@ -471,13 +473,21 @@ public class Console implements Closeable {
     writer().println(String.format("%-20s : %s", "Value format", source.getFormat()));
 
     if (!source.getTopic().isEmpty()) {
-      writer().println(String.format(
-          "%-20s : %s (partitions: %d, replication: %d)",
+      String topicInformation = String.format("%-20s : %s",
           "Kafka topic",
-          source.getTopic(),
-          source.getPartitions(),
-          source.getReplication()
-      ));
+          source.getTopic()
+      );
+
+      // If Describe ACLs permissions aren't given for a topic, partitions and replica default to 0
+      // Details aren't printed out if the Describe fails.
+      if (source.getPartitions() != 0) {
+        topicInformation = topicInformation.concat(String.format(
+            " (partitions: %d, replication: %d)",
+            source.getPartitions(),
+            source.getReplication()
+        ));
+      }
+      writer().println(topicInformation);
     }
   }
 
@@ -624,6 +634,44 @@ public class Console implements Closeable {
     printExecutionPlan(query);
     printTopology(query);
     printOverriddenProperties(query);
+  }
+
+  private void printConnectorDescription(final ConnectorDescription description) {
+    final ConnectorStateInfo status = description.getStatus();
+    writer().println(String.format("%-20s : %s", "Name", status.name()));
+    writer().println(String.format("%-20s : %s", "Class", description.getConnectorClass()));
+    writer().println(String.format("%-20s : %s", "Type", description.getStatus().type()));
+    writer().println(String.format("%-20s : %s", "State", status.connector().state()));
+    writer().println(String.format("%-20s : %s", "WorkerId", status.connector().workerId()));
+    if (!status.connector().trace().isEmpty()) {
+      writer().println(String.format("%-20s : %s", "Trace", status.connector().trace()));
+    }
+    writer().println();
+
+    if (!status.tasks().isEmpty()) {
+      final Table taskTable = new Table.Builder()
+          .withColumnHeaders(ImmutableList.of("Task ID", "State", "Error Trace"))
+          .withRows(status.tasks()
+              .stream()
+              .map(task -> ImmutableList.of(
+                  String.valueOf(task.id()),
+                  task.state(),
+                  ObjectUtils.defaultIfNull(task.trace(), ""))))
+          .build();
+      taskTable.print(this);
+      writer().println();
+    }
+
+    if (!description.getSources().isEmpty()) {
+      final Table sourceTable = new Table.Builder()
+          .withColumnHeaders("KSQL Source Name", "Kafka Topic", "Type")
+          .withRows(description.getSources()
+              .stream()
+              .map(source -> ImmutableList
+                  .of(source.getName(), source.getTopic(), source.getType())))
+          .build();
+      sourceTable.print(this);
+    }
   }
 
   private void printQueryDescriptionList(final QueryDescriptionList queryDescriptionList) {

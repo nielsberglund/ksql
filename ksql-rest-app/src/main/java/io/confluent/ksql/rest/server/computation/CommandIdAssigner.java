@@ -16,6 +16,7 @@
 package io.confluent.ksql.rest.server.computation;
 
 import com.google.common.collect.ImmutableMap;
+import io.confluent.ksql.parser.DropType;
 import io.confluent.ksql.parser.tree.CreateStream;
 import io.confluent.ksql.parser.tree.CreateStreamAsSelect;
 import io.confluent.ksql.parser.tree.CreateTable;
@@ -23,6 +24,7 @@ import io.confluent.ksql.parser.tree.CreateTableAsSelect;
 import io.confluent.ksql.parser.tree.DropStream;
 import io.confluent.ksql.parser.tree.DropTable;
 import io.confluent.ksql.parser.tree.InsertInto;
+import io.confluent.ksql.parser.tree.RegisterType;
 import io.confluent.ksql.parser.tree.Statement;
 import io.confluent.ksql.parser.tree.TerminateQuery;
 import io.confluent.ksql.rest.server.computation.CommandId.Action;
@@ -46,6 +48,10 @@ public class CommandIdAssigner {
             command -> getSelectStreamCommandId((CreateStreamAsSelect) command))
           .put(CreateTableAsSelect.class,
             command -> getSelectTableCommandId((CreateTableAsSelect) command))
+          .put(RegisterType.class,
+              command -> getRegisterTypeCommandId((RegisterType) command))
+          .put(DropType.class,
+              command -> getDropTypeCommandId((DropType) command))
           .put(InsertInto.class,
             command -> getInsertIntoCommandId((InsertInto) command))
           .put(TerminateQuery.class,
@@ -90,8 +96,16 @@ public class CommandIdAssigner {
   }
 
   private static CommandId getInsertIntoCommandId(final InsertInto insertInto) {
-    return  new CommandId(CommandId.Type.STREAM, insertInto.getTarget().toString(),
+    return new CommandId(CommandId.Type.STREAM, insertInto.getTarget().toString(),
         CommandId.Action.CREATE);
+  }
+
+  private static CommandId getRegisterTypeCommandId(final RegisterType registerType) {
+    return new CommandId(CommandId.Type.TYPE, registerType.getName(), Action.CREATE);
+  }
+
+  private static CommandId getDropTypeCommandId(final DropType dropType) {
+    return new CommandId(CommandId.Type.TYPE, dropType.getTypeName(), Action.DROP);
   }
 
   private static CommandId getTerminateCommandId(final TerminateQuery terminateQuery) {

@@ -25,9 +25,7 @@ import io.confluent.ksql.function.udaf.topkdistinct.TopkDistinctAggFunctionFacto
 import io.confluent.ksql.function.udf.UdfMetadata;
 import io.confluent.ksql.function.udf.json.ArrayContainsKudf;
 import io.confluent.ksql.function.udf.json.JsonExtractStringKudf;
-import io.confluent.ksql.function.udf.math.AbsKudf;
 import io.confluent.ksql.function.udf.math.CeilKudf;
-import io.confluent.ksql.function.udf.math.FloorKudf;
 import io.confluent.ksql.function.udf.math.RandomKudf;
 import io.confluent.ksql.function.udf.math.RoundKudf;
 import io.confluent.ksql.function.udf.string.ConcatKudf;
@@ -222,27 +220,9 @@ public class InternalFunctionRegistry implements MutableFunctionRegistry {
 
       addBuiltInFunction(KsqlFunction.createLegacyBuiltIn(
           Schema.OPTIONAL_FLOAT64_SCHEMA,
-          ImmutableList.of(Schema.OPTIONAL_FLOAT64_SCHEMA),
-          AbsKudf.NAME,
-          AbsKudf.class));
-
-      addBuiltInFunction(KsqlFunction.createLegacyBuiltIn(
-          Schema.OPTIONAL_FLOAT64_SCHEMA,
-          Collections.singletonList(Schema.OPTIONAL_INT64_SCHEMA),
-          AbsKudf.NAME,
-          AbsKudf.class));
-
-      addBuiltInFunction(KsqlFunction.createLegacyBuiltIn(
-          Schema.OPTIONAL_FLOAT64_SCHEMA,
           Collections.singletonList(Schema.OPTIONAL_FLOAT64_SCHEMA),
           "CEIL",
           CeilKudf.class));
-
-      addBuiltInFunction(KsqlFunction.createLegacyBuiltIn(
-          Schema.OPTIONAL_FLOAT64_SCHEMA,
-          Collections.singletonList(Schema.OPTIONAL_FLOAT64_SCHEMA),
-          "FLOOR",
-          FloorKudf.class));
 
       addBuiltInFunction(KsqlFunction.createLegacyBuiltIn(
           Schema.OPTIONAL_INT64_SCHEMA,

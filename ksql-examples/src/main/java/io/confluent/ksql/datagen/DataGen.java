@@ -16,10 +16,12 @@
 package io.confluent.ksql.datagen;
 
 import com.google.common.collect.ImmutableMap;
+import com.google.common.util.concurrent.RateLimiter;
 import io.confluent.avro.random.generator.Generator;
 import io.confluent.ksql.serde.Format;
 import io.confluent.ksql.util.KsqlConfig;
 import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Arrays;
@@ -28,7 +30,14 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Random;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletionService;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.Executors;
 import java.util.function.BiConsumer;
+import java.util.function.Supplier;
 
 public final class DataGen {
 
@@ -42,13 +51,13 @@ public final class DataGen {
       System.err.println(exception.getMessage());
       usage();
       System.exit(1);
-    } catch (final Exception e) {
+    } catch (final Throwable e) {
       e.printStackTrace();
       System.exit(1);
     }
   }
 
-  static void run(final String... args) throws IOException {
+  static void run(final String... args) throws Throwable {
     final Arguments arguments = new Arguments.Builder()
         .parseArgs(args)
         .build();
@@ -58,18 +67,56 @@ public final class DataGen {
       return;
     }
 
-    final Generator generator = new Generator(arguments.schemaFile, new Random());
     final Properties props = getProperties(arguments);
-    final DataGenProducer dataProducer = new ProducerFactory().getProducer(arguments.format, props);
+    final DataGenProducer dataProducer = ProducerFactory
+        .getProducer(arguments.keyFormat, arguments.valueFormat, props);
+    final Optional<RateLimiter> rateLimiter = arguments.msgRate != -1
+        ? Optional.of(RateLimiter.create(arguments.msgRate)) : Optional.empty();
 
-    dataProducer.populateTopic(
-        props,
-        generator,
-        arguments.topicName,
-        arguments.keyName,
-        arguments.iterations,
-        arguments.maxInterval
+    final Executor executor = Executors.newFixedThreadPool(
+        arguments.numThreads,
+        r -> {
+          final Thread thread = new Thread(r);
+          thread.setDaemon(true);
+          return thread;
+        }
     );
+    final CompletionService<Void> service = new ExecutorCompletionService<>(executor);
+
+    for (int i = 0; i < arguments.numThreads; i++) {
+      service.submit(getProducerTask(arguments, dataProducer, props, rateLimiter));
+    }
+    for (int i = 0; i < arguments.numThreads; i++) {
+      try {
+        service.take().get();
+      } catch (final InterruptedException e) {
+        System.err.println("Interrupted waiting for threads to exit.");
+        System.exit(1);
+      } catch (final ExecutionException e) {
+        throw e.getCause();
+      }
+    }
+  }
+
+  private static Callable<Void> getProducerTask(
+      final Arguments arguments,
+      final DataGenProducer dataProducer,
+      final Properties props,
+      final Optional<RateLimiter> rateLimiter) throws IOException {
+    final Generator generator = new Generator(arguments.schemaFile.get(), new Random());
+    return () -> {
+      dataProducer.populateTopic(
+          props,
+          generator,
+          arguments.topicName,
+          arguments.keyName,
+          arguments.iterations,
+          arguments.maxInterval,
+          arguments.printRows,
+          rateLimiter
+      );
+      return null;
+    };
   }
 
   static Properties getProperties(final Arguments arguments) throws IOException {
@@ -96,13 +143,18 @@ public final class DataGen {
         + "schema=<avro schema file> " + newLine
         + "[schemaRegistryUrl=<url for Confluent Schema Registry> "
         + "(defaults to http://localhost:8081)] " + newLine
-        + "format=<message format> (case-insensitive; one of 'avro', 'json', or "
+        + "key-format=<message key format> (case-insensitive; one of 'avro', 'json', 'kafka' or "
         + "'delimited') " + newLine
+        + "value-format=<message value format> (case-insensitive; one of 'avro', 'json' or "
+            + "'delimited') " + newLine
         + "topic=<kafka topic name> " + newLine
         + "key=<name of key column> " + newLine
         + "[iterations=<number of rows> (defaults to 1,000,000)] " + newLine
         + "[maxInterval=<Max time in ms between rows> (defaults to 500)] " + newLine
-        + "[propertiesFile=<file specifying Kafka client properties>]" + newLine
+        + "[propertiesFile=<file specifying Kafka client properties>] " + newLine
+        + "[nThreads=<number of producer threads to start>] " + newLine
+        + "[msgRate=<rate to produce in msgs/second>] " + newLine
+        + "[printRows=<true|false>]" + newLine
     );
   }
 
@@ -110,37 +162,51 @@ public final class DataGen {
 
     private final boolean help;
     private final String bootstrapServer;
-    private final InputStream schemaFile;
-    private final Format format;
+    private final Supplier<InputStream> schemaFile;
+    private final Format keyFormat;
+    private final Format valueFormat;
     private final String topicName;
     private final String keyName;
     private final int iterations;
     private final long maxInterval;
     private final String schemaRegistryUrl;
     private final InputStream propertiesFile;
+    private final int numThreads;
+    private final int msgRate;
+    private final boolean printRows;
 
+    // CHECKSTYLE_RULES.OFF: ParameterNumberCheck
     Arguments(
         final boolean help,
         final String bootstrapServer,
-        final InputStream schemaFile,
-        final Format format,
+        final Supplier<InputStream> schemaFile,
+        final Format keyFormat,
+        final Format valueFormat,
         final String topicName,
         final String keyName,
         final int iterations,
         final long maxInterval,
         final String schemaRegistryUrl,
-        final InputStream propertiesFile
+        final InputStream propertiesFile,
+        final int numThreads,
+        final int msgRate,
+        final boolean printRows
     ) {
+      // CHECKSTYLE_RULES.ON: ParameterNumberCheck
       this.help = help;
       this.bootstrapServer = bootstrapServer;
       this.schemaFile = schemaFile;
-      this.format = format;
+      this.keyFormat = keyFormat;
+      this.valueFormat = valueFormat;
       this.topicName = topicName;
       this.keyName = keyName;
       this.iterations = iterations;
       this.maxInterval = maxInterval;
       this.schemaRegistryUrl = schemaRegistryUrl;
       this.propertiesFile = propertiesFile;
+      this.numThreads = numThreads;
+      this.msgRate = msgRate;
+      this.printRows = printRows;
     }
 
     static class ArgumentParseException extends RuntimeException {
@@ -157,42 +223,56 @@ public final class DataGen {
               .put("quickstart", (builder, argVal) -> builder.quickstart = parseQuickStart(argVal))
               .put("bootstrap-server", (builder, argVal) -> builder.bootstrapServer = argVal)
               .put("schema", (builder, argVal) -> builder.schemaFile = toFileInputStream(argVal))
-              .put("format", (builder, argVal) -> builder.format = parseFormat(argVal))
+              .put("key-format", (builder, arg) -> builder.keyFormat = parseFormat(arg))
+              .put("value-format", (builder, arg) -> builder.valueFormat = parseFormat(arg))
+              // "format" is maintained for backwards compatibility, but should be removed later.
+              .put("format", (builder, argVal) -> builder.valueFormat = parseFormat(argVal))
               .put("topic", (builder, argVal) -> builder.topicName = argVal)
               .put("key", (builder, argVal) -> builder.keyName = argVal)
-              .put("iterations", (builder, argVal) -> builder.iterations = parseIterations(argVal))
+              .put("iterations", (builder, argVal) -> builder.iterations = parseInt(argVal, 1))
               .put("maxInterval",
-                  (builder, argVal) -> builder.maxInterval = parseIterations(argVal))
+                  (builder, argVal) -> builder.maxInterval = parseInt(argVal, 0))
               .put("schemaRegistryUrl", (builder, argVal) -> builder.schemaRegistryUrl = argVal)
               .put("propertiesFile",
-                  (builder, argVal) -> builder.propertiesFile = toFileInputStream(argVal))
+                  (builder, argVal) -> builder.propertiesFile = toFileInputStream(argVal).get())
+              .put("msgRate", (builder, argVal) -> builder.msgRate = parseInt(argVal, 1))
+              .put("nThreads", (builder, argVal) -> builder.numThreads = parseNumThreads(argVal))
+              .put("printRows", (builder, argVal) -> builder.printRows = parsePrintRows(argVal))
               .build();
 
       private Quickstart quickstart;
 
       private boolean help;
       private String bootstrapServer;
-      private InputStream schemaFile;
-      private Format format;
+      private Supplier<InputStream> schemaFile;
+      private Format keyFormat;
+      private Format valueFormat;
       private String topicName;
       private String keyName;
       private int iterations;
       private long maxInterval;
       private String schemaRegistryUrl;
       private InputStream propertiesFile;
+      private int msgRate;
+      private int numThreads;
+      private boolean printRows;
 
       private Builder() {
         quickstart = null;
         help = false;
         bootstrapServer = "localhost:9092";
         schemaFile = null;
-        format = null;
+        keyFormat = Format.KAFKA;
+        valueFormat = null;
         topicName = null;
         keyName = null;
         iterations = 1000000;
         maxInterval = -1;
         schemaRegistryUrl = "http://localhost:8081";
         propertiesFile = null;
+        msgRate = -1;
+        numThreads = 1;
+        printRows = true;
       }
 
       private enum Quickstart {
@@ -215,8 +295,8 @@ public final class DataGen {
           this.keyName = keyName;
         }
 
-        public InputStream getSchemaFile() {
-          return getClass().getClassLoader().getResourceAsStream(schemaFileName);
+        public Supplier<InputStream> getSchemaFile() {
+          return () -> getClass().getClassLoader().getResourceAsStream(schemaFileName);
         }
 
         public String getTopicName(final Format format) {
@@ -227,27 +307,47 @@ public final class DataGen {
           return keyName;
         }
 
-        public Format getFormat() {
-          return Format.JSON;
+        public Format getKeyFormat() {
+          return Format.KAFKA;
         }
 
+        public Format getValueFormat() {
+          return Format.JSON;
+        }
       }
 
       Arguments build() {
         if (help) {
-          return new Arguments(true, null, null, null, null, null, 0, -1, null, null);
+          return new Arguments(
+              true,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              0,
+              -1,
+              null,
+              null,
+              1,
+              -1,
+              true
+          );
         }
 
         if (quickstart != null) {
           schemaFile = Optional.ofNullable(schemaFile).orElse(quickstart.getSchemaFile());
-          format = Optional.ofNullable(format).orElse(quickstart.getFormat());
-          topicName = Optional.ofNullable(topicName).orElse(quickstart.getTopicName(format));
+          keyFormat = Optional.ofNullable(keyFormat).orElse(quickstart.getKeyFormat());
+          valueFormat = Optional.ofNullable(valueFormat).orElse(quickstart.getValueFormat());
+          topicName = Optional.ofNullable(topicName).orElse(quickstart.getTopicName(valueFormat));
           keyName = Optional.ofNullable(keyName).orElse(quickstart.getKeyName());
         }
 
         try {
           Objects.requireNonNull(schemaFile, "Schema file not provided");
-          Objects.requireNonNull(format, "Message format not provided");
+          Objects.requireNonNull(keyFormat, "Message key format not provided");
+          Objects.requireNonNull(valueFormat, "Message value format not provided");
           Objects.requireNonNull(topicName, "Kafka topic name not provided");
           Objects.requireNonNull(keyName, "Name of key column not provided");
         } catch (final NullPointerException exception) {
@@ -257,13 +357,17 @@ public final class DataGen {
             help,
             bootstrapServer,
             schemaFile,
-            format,
+            keyFormat,
+            valueFormat,
             topicName,
             keyName,
             iterations,
             maxInterval,
             schemaRegistryUrl,
-            propertiesFile
+            propertiesFile,
+            numThreads,
+            msgRate,
+            printRows
         );
       }
 
@@ -323,12 +427,14 @@ public final class DataGen {
         handler.accept(this, argVal);
       }
 
-      private static FileInputStream toFileInputStream(final String argVal) {
-        try {
-          return new FileInputStream(argVal);
-        } catch (final Exception e) {
-          throw new IllegalArgumentException("File not found: " + argVal, e);
-        }
+      private static Supplier<InputStream> toFileInputStream(final String argVal) {
+        return () -> {
+          try {
+            return new FileInputStream(argVal);
+          } catch (final FileNotFoundException e) {
+            throw new IllegalArgumentException("File not found: " + argVal, e);
+          }
+        };
       }
 
       private static Quickstart parseQuickStart(final String argValue) {
@@ -349,26 +455,56 @@ public final class DataGen {
           return Format.valueOf(formatString.toUpperCase());
         } catch (final IllegalArgumentException exception) {
           throw new ArgumentParseException(String.format(
-              "Invalid format in '%s'; was expecting one of AVRO, JSON, or DELIMITED "
+              "Invalid format in '%s'; was expecting one of AVRO, JSON, KAFKA or DELIMITED "
               + "(case-insensitive)",
               formatString
           ));
         }
       }
 
-      private static int parseIterations(final String iterationsString) {
+      private static int parseNumThreads(final String numThreadsString) {
+        try {
+          final int result = Integer.valueOf(numThreadsString, 10);
+          if (result < 0) {
+            throw new ArgumentParseException(String.format(
+                "Invalid number of threads in '%d'; must be a positive number",
+                result));
+          }
+          return result;
+        } catch (NumberFormatException e) {
+          throw new ArgumentParseException(String.format(
+              "Invalid number of threads in '%s'; must be a positive number",
+              numThreadsString));
+        }
+      }
+
+      private static boolean parsePrintRows(final String printRowsString) {
+        switch (printRowsString.toLowerCase()) {
+          case "false":
+            return false;
+          case "true":
+            return true;
+          default:
+            throw new ArgumentParseException(String.format(
+                "Invalid value for printRows in '%s'; must be true or false",
+                printRowsString
+            ));
+        }
+      }
+
+      private static int parseInt(final String iterationsString, final int minValue) {
         try {
           final int result = Integer.valueOf(iterationsString, 10);
-          if (result <= 0) {
+          if (result < minValue) {
             throw new ArgumentParseException(String.format(
-                "Invalid number of iterations in '%d'; must be a positive number",
-                result
+                "Invalid integer value '%d'; must be >= %d",
+                result, minValue
             ));
           }
           return Integer.valueOf(iterationsString, 10);
         } catch (final NumberFormatException exception) {
           throw new ArgumentParseException(String.format(
-              "Invalid number of iterations in '%s'; must be a valid base 10 integer",
+              "Invalid integer value '%s'; must be a valid base 10 integer",
               iterationsString
           ));
         }

@@ -93,7 +93,6 @@ KSQL 5.3.0 includes bug fixes, including:
 * Fixed issues with using ``AS`` keyword when aliasing sources.
   See `#2732 <https://github.com/confluentinc/ksql/issues/2732>`_ for more info.
 
-
 Version 5.2.0
 -------------
 
@@ -113,10 +112,12 @@ KSQL 5.2 includes new features, including:
   to log to Kafka to be consumed as a KSQL stream. See :ref:`KSQL processing log <ksql_processing_log>`
   for more details.
 * Aggregation functionality has been extended. KSQL now supports:
+
   * ``GROUP BY`` more than just simple columns, including fields within structs,
     arithmetic results, functions, string concatenations and literals.
   * literals in the projection, (a.k.a the ``SELECT`` clause).
   * Multiple ``HAVING`` clauses, including the use of aggregate functions and literals.
+  
 * Automatic compatibility management for queries in headless mode across versions. Starting with 5.2, KSQL will automatically take care
   of ensuring query compatiblity when upgrading. This means you won't need to worry about setting properties correctly during upgrade, as
   has been required for previous upgrades. Refer to the :ref:`architecture documentation <ksql-architecture-config-topic>` for details.

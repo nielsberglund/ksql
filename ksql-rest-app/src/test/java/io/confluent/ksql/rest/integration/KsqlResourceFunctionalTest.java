@@ -36,8 +36,6 @@ import io.confluent.ksql.schema.ksql.LogicalSchema;
 import io.confluent.ksql.schema.ksql.PhysicalSchema;
 import io.confluent.ksql.serde.Format;
 import io.confluent.ksql.serde.SerdeOption;
-import io.confluent.ksql.services.ServiceContext;
-import io.confluent.ksql.test.util.KsqlIdentifierTestUtil;
 import io.confluent.ksql.util.KsqlConstants;
 import io.confluent.ksql.util.SchemaUtil;
 import java.util.List;
@@ -47,14 +45,10 @@ import kafka.zookeeper.ZooKeeperClientException;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
-import org.glassfish.hk2.api.Factory;
-import org.glassfish.hk2.utilities.binding.AbstractBinder;
-import org.glassfish.jersey.process.internal.RequestScoped;
 import org.hamcrest.Description;
 import org.hamcrest.Matcher;
 import org.hamcrest.TypeSafeMatcher;
 import org.junit.After;
-import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
 import org.junit.Test;
@@ -73,25 +67,7 @@ public class KsqlResourceFunctionalTest {
 
   private static final TestKsqlRestApp REST_APP = TestKsqlRestApp
       .builder(TEST_HARNESS::kafkaBootstrapServers)
-      .withServiceContextBinder((config, extension) -> new AbstractBinder() {
-        @Override
-        protected void configure() {
-          bindFactory(new Factory<ServiceContext>() {
-            @Override
-            public ServiceContext provide() {
-              return TEST_HARNESS.getServiceContext();
-            }
-
-            @Override
-            public void dispose(final ServiceContext serviceContext) {
-              // do nothing because TEST_HARNESS#getServiceContext always
-              // returns the same instance
-            }
-          })
-              .to(ServiceContext.class)
-              .in(RequestScoped.class);
-        }
-      })
+      .withStaticServiceContext(TEST_HARNESS::getServiceContext)
       .build();
 
   @ClassRule
@@ -100,20 +76,11 @@ public class KsqlResourceFunctionalTest {
       .around(TEST_HARNESS)
       .around(REST_APP);
 
-  private String source;
-
   @BeforeClass
   public static void setUpClass() {
     TEST_HARNESS.ensureTopics(PAGE_VIEW_TOPIC);
     NEXT_QUERY_ID.set(0);
     RestIntegrationTestUtil.createStreams(REST_APP, PAGE_VIEW_STREAM, PAGE_VIEW_TOPIC);
-  }
-
-  @Before
-  public void setUp() {
-    source = KsqlIdentifierTestUtil.uniqueIdentifierName("source");
-
-    RestIntegrationTestUtil.createStreams(REST_APP, source, PAGE_VIEW_TOPIC);
   }
 
   @After
@@ -127,7 +94,7 @@ public class KsqlResourceFunctionalTest {
   public void shouldDistributeMultipleInterDependantDmlStatements() {
     // When:
     final List<KsqlEntity> results = makeKsqlRequest(
-        "CREATE STREAM S AS SELECT * FROM " + source + ";"
+        "CREATE STREAM S AS SELECT * FROM " + PAGE_VIEW_STREAM + ";"
             + "CREATE STREAM S2 AS SELECT * FROM S;"
     );
 
@@ -149,7 +116,7 @@ public class KsqlResourceFunctionalTest {
   public void shouldHandleInterDependantExecutableAndNonExecutableStatements() {
     // When:
     final List<KsqlEntity> results = makeKsqlRequest(
-        "CREATE STREAM S AS SELECT * FROM " + source + ";"
+        "CREATE STREAM S AS SELECT * FROM " + PAGE_VIEW_STREAM + ";"
             + "DESCRIBE S;"
     );
 
@@ -164,7 +131,7 @@ public class KsqlResourceFunctionalTest {
   public void shouldHandleInterDependantCsasTerminateAndDrop() {
     // When:
     final List<KsqlEntity> results = makeKsqlRequest(
-        "CREATE STREAM SS AS SELECT * FROM " + source + ";"
+        "CREATE STREAM SS AS SELECT * FROM " + PAGE_VIEW_STREAM + ";"
             + "TERMINATE CSAS_SS_" + NEXT_QUERY_ID.get() + ";"
             + "DROP STREAM SS;"
     );

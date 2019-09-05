@@ -66,7 +66,9 @@ import io.confluent.ksql.KsqlConfigTestUtil;
 import io.confluent.ksql.KsqlExecutionContext;
 import io.confluent.ksql.engine.KsqlEngine;
 import io.confluent.ksql.engine.KsqlEngineTestUtil;
-import io.confluent.ksql.engine.TopicAccessValidator;
+import io.confluent.ksql.exception.KsqlTopicAuthorizationException;
+import io.confluent.ksql.execution.expression.tree.QualifiedName;
+import io.confluent.ksql.execution.expression.tree.StringLiteral;
 import io.confluent.ksql.function.InternalFunctionRegistry;
 import io.confluent.ksql.metastore.MetaStoreImpl;
 import io.confluent.ksql.metastore.model.DataSource.DataSourceType;
@@ -78,9 +80,7 @@ import io.confluent.ksql.parser.KsqlParser.PreparedStatement;
 import io.confluent.ksql.parser.properties.with.CreateSourceProperties;
 import io.confluent.ksql.parser.tree.CreateStream;
 import io.confluent.ksql.parser.tree.CreateStreamAsSelect;
-import io.confluent.ksql.parser.tree.QualifiedName;
 import io.confluent.ksql.parser.tree.Statement;
-import io.confluent.ksql.parser.tree.StringLiteral;
 import io.confluent.ksql.parser.tree.TableElement;
 import io.confluent.ksql.parser.tree.TableElement.Namespace;
 import io.confluent.ksql.parser.tree.TableElements;
@@ -118,8 +118,12 @@ import io.confluent.ksql.rest.util.EntityUtil;
 import io.confluent.ksql.rest.util.TerminateCluster;
 import io.confluent.ksql.schema.ksql.LogicalSchema;
 import io.confluent.ksql.schema.ksql.types.SqlTypes;
+import io.confluent.ksql.security.KsqlAuthorizationValidator;
+import io.confluent.ksql.serde.Format;
+import io.confluent.ksql.serde.FormatInfo;
+import io.confluent.ksql.serde.KeyFormat;
 import io.confluent.ksql.serde.SerdeOption;
-import io.confluent.ksql.serde.json.KsqlJsonSerdeFactory;
+import io.confluent.ksql.serde.ValueFormat;
 import io.confluent.ksql.services.FakeKafkaTopicClient;
 import io.confluent.ksql.services.SandboxedServiceContext;
 import io.confluent.ksql.services.ServiceContext;
@@ -155,12 +159,13 @@ import javax.ws.rs.core.Response;
 import org.apache.avro.Schema.Type;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.producer.ProducerConfig;
-import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.common.acl.AclOperation;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.streams.StreamsConfig;
 import org.eclipse.jetty.http.HttpStatus.Code;
 import org.hamcrest.CoreMatchers;
+import org.hamcrest.Matchers;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -190,7 +195,7 @@ public class KsqlResourceTest {
   private static final ClusterTerminateRequest VALID_TERMINATE_REQUEST =
       new ClusterTerminateRequest(ImmutableList.of("Foo"));
   private static final TableElements SOME_ELEMENTS = TableElements.of(
-      new TableElement(Namespace.VALUE, "f0", new io.confluent.ksql.parser.tree.Type(SqlTypes.STRING))
+      new TableElement(Namespace.VALUE, "f0", new io.confluent.ksql.execution.expression.tree.Type(SqlTypes.STRING))
   );
   private static final PreparedStatement<CreateStream> STMT_0_WITH_SCHEMA = PreparedStatement.of(
       "sql with schema",
@@ -255,7 +260,7 @@ public class KsqlResourceTest {
   @Mock
   private Injector sandboxTopicInjector;
   @Mock
-  private TopicAccessValidator topicAccessValidator;
+  private KsqlAuthorizationValidator authorizationValidator;
 
   private KsqlResource ksqlResource;
   private SchemaRegistryClient schemaRegistryClient;
@@ -324,6 +329,71 @@ public class KsqlResourceTest {
   public void tearDown() {
     realEngine.close();
     serviceContext.close();
+  }
+
+  @Test(expected = IllegalArgumentException.class)
+  public void shouldThrowOnConfigureIfAppServerNotSet() {
+    // Given:
+    final KsqlConfig configNoAppServer = new KsqlConfig(ImmutableMap.of());
+
+    // When:
+    ksqlResource.configure(configNoAppServer);
+  }
+
+  @Test
+  public void shouldThrowOnHandleStatementIfNotConfigured() {
+    // Given:
+    ksqlResource = new KsqlResource(
+        ksqlEngine,
+        commandStore,
+        DISTRIBUTED_COMMAND_RESPONSE_TIMEOUT,
+        activenessRegistrar,
+        (ec, sc) -> InjectorChain.of(
+            schemaInjectorFactory.apply(sc),
+            topicInjectorFactory.apply(ec),
+            new TopicDeleteInjector(ec, sc)),
+        authorizationValidator
+    );
+
+    // Then:
+    expectedException.expect(KsqlRestException.class);
+    expectedException.expect(exceptionStatusCode(CoreMatchers.is(Code.SERVICE_UNAVAILABLE)));
+    expectedException
+        .expect(exceptionErrorMessage(errorMessage(Matchers.is("Server initializing"))));
+
+    // When:
+    ksqlResource.handleKsqlStatements(
+        serviceContext,
+        new KsqlRequest("query", Collections.emptyMap(), null)
+    );
+  }
+
+  @Test
+  public void shouldThrowOnHandleTerminateIfNotConfigured() {
+    // Given:
+    ksqlResource = new KsqlResource(
+        ksqlEngine,
+        commandStore,
+        DISTRIBUTED_COMMAND_RESPONSE_TIMEOUT,
+        activenessRegistrar,
+        (ec, sc) -> InjectorChain.of(
+            schemaInjectorFactory.apply(sc),
+            topicInjectorFactory.apply(ec),
+            new TopicDeleteInjector(ec, sc)),
+        authorizationValidator
+    );
+
+    // Then:
+    expectedException.expect(KsqlRestException.class);
+    expectedException.expect(exceptionStatusCode(CoreMatchers.is(Code.SERVICE_UNAVAILABLE)));
+    expectedException
+        .expect(exceptionErrorMessage(errorMessage(Matchers.is("Server initializing"))));
+
+    // When:
+    ksqlResource.terminateCluster(
+        serviceContext,
+        new ClusterTerminateRequest(ImmutableList.of(""))
+    );
   }
 
   @Test
@@ -640,6 +710,46 @@ public class KsqlResourceTest {
   }
 
   @Test
+  public void shouldReturnForbiddenKafkaAccessIfKsqlTopicAuthorizationException() {
+    // Given:
+    doThrow(new KsqlTopicAuthorizationException(
+        AclOperation.DELETE,
+        Collections.singleton("topic"))).when(authorizationValidator).checkAuthorization(any(), any(), any());
+
+    // When:
+    final KsqlErrorMessage result = makeFailingRequest(
+        "DROP STREAM TEST_STREAM DELETE TOPIC;",
+        Code.FORBIDDEN);
+
+    // Then:
+    assertThat(result, is(instanceOf(KsqlErrorMessage.class)));
+    assertThat(result.getErrorCode(), is(Errors.ERROR_CODE_FORBIDDEN_KAFKA_ACCESS));
+  }
+
+  @Test
+  public void shouldReturnForbiddenKafkaAccessIfRootCauseKsqlTopicAuthorizationException() {
+    // Given:
+    doThrow(new KsqlException("Could not delete the corresponding kafka topic: topic",
+        new KsqlTopicAuthorizationException(
+          AclOperation.DELETE,
+          Collections.singleton("topic"))))
+        .when(authorizationValidator).checkAuthorization(any(), any(), any());
+
+
+    // When:
+    final KsqlErrorMessage result = makeFailingRequest(
+            "DROP STREAM TEST_STREAM DELETE TOPIC;",
+            Code.FORBIDDEN);
+
+    // Then:
+    assertThat(result, is(instanceOf(KsqlErrorMessage.class)));
+    assertThat(result.getErrorCode(), is(Errors.ERROR_CODE_FORBIDDEN_KAFKA_ACCESS));
+    assertThat(result.getMessage(), is(
+        "Could not delete the corresponding kafka topic: topic\n" +
+              "Caused by: Authorization denied to Delete on topic(s): [topic]"));
+  }
+
+  @Test
   public void shouldReturnBadStatementIfStatementFailsValidation() {
     // When:
     final KsqlErrorMessage result = makeFailingRequest(
@@ -852,7 +962,7 @@ public class KsqlResourceTest {
     // Then:
     assertThat(result.getErrorCode(), is(Errors.ERROR_CODE_BAD_STATEMENT));
     assertThat(result.getMessage(),
-        containsString("Cannot register avro schema for S1 as the schema registry rejected it"));
+        containsString("Cannot register avro schema for S1 as the schema is incompatible with the current schema version registered for the topic"));
   }
 
   @Test
@@ -1870,7 +1980,6 @@ public class KsqlResourceTest {
 
   private void setUpKsqlResource() {
     ksqlResource = new KsqlResource(
-        ksqlConfig,
         ksqlEngine,
         commandStore,
         DISTRIBUTED_COMMAND_RESPONSE_TIMEOUT,
@@ -1879,8 +1988,10 @@ public class KsqlResourceTest {
             schemaInjectorFactory.apply(sc),
             topicInjectorFactory.apply(ec),
             new TopicDeleteInjector(ec, sc)),
-        topicAccessValidator
+        authorizationValidator
     );
+
+    ksqlResource.configure(ksqlConfig);
   }
 
   private void givenKsqlConfigWith(final Map<String, Object> additionalConfig) {
@@ -1918,8 +2029,11 @@ public class KsqlResourceTest {
   ) {
     final KsqlTopic ksqlTopic = new KsqlTopic(
         topicName,
-        new KsqlJsonSerdeFactory(),
-        false);
+        KeyFormat.nonWindowed(FormatInfo.of(Format.KAFKA)),
+        ValueFormat.of(FormatInfo.of(Format.JSON)),
+        false
+    );
+
     givenKafkaTopicExists(topicName);
     if (type == DataSourceType.KSTREAM) {
       metaStore.putSource(
@@ -1930,8 +2044,7 @@ public class KsqlResourceTest {
               SerdeOption.none(),
               KeyField.of(schema.valueFields().get(0).name(), schema.valueFields().get(0)),
               new MetadataTimestampExtractionPolicy(),
-              ksqlTopic,
-              Serdes::String
+              ksqlTopic
           ));
     }
     if (type == DataSourceType.KTABLE) {
@@ -1943,8 +2056,7 @@ public class KsqlResourceTest {
               SerdeOption.none(),
               KeyField.of(schema.valueFields().get(0).name(), schema.valueFields().get(0)),
               new MetadataTimestampExtractionPolicy(),
-              ksqlTopic,
-              Serdes::String
+              ksqlTopic
           ));
     }
   }
@@ -1954,6 +2066,7 @@ public class KsqlResourceTest {
     configMap.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
     configMap.put("ksql.command.topic.suffix", "commands");
     configMap.put(RestConfig.LISTENERS_CONFIG, "http://localhost:8088");
+    configMap.put(StreamsConfig.APPLICATION_SERVER_CONFIG, "http://localhost:9099");
 
     final Properties properties = new Properties();
     properties.putAll(configMap);

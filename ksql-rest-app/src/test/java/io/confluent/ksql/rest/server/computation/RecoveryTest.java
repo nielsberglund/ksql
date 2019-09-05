@@ -16,7 +16,6 @@
 package io.confluent.ksql.rest.server.computation;
 
 import static org.hamcrest.CoreMatchers.equalTo;
-import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.hasItem;
@@ -36,19 +35,17 @@ import io.confluent.ksql.metastore.model.DataSource;
 import io.confluent.ksql.metastore.model.KsqlTopic;
 import io.confluent.ksql.query.QueryId;
 import io.confluent.ksql.rest.entity.KsqlRequest;
-import io.confluent.ksql.rest.server.StatementParser;
 import io.confluent.ksql.rest.server.computation.CommandId.Action;
 import io.confluent.ksql.rest.server.computation.CommandId.Type;
 import io.confluent.ksql.rest.server.resources.KsqlResource;
 import io.confluent.ksql.rest.server.state.ServerState;
 import io.confluent.ksql.rest.util.ClusterTerminator;
 import io.confluent.ksql.schema.ksql.LogicalSchema;
-import io.confluent.ksql.serde.KsqlSerdeFactory;
+import io.confluent.ksql.serde.ValueFormat;
 import io.confluent.ksql.services.FakeKafkaTopicClient;
 import io.confluent.ksql.services.ServiceContext;
 import io.confluent.ksql.services.TestServiceContext;
 import io.confluent.ksql.statement.ConfiguredStatement;
-import io.confluent.ksql.statement.Injectors;
 import io.confluent.ksql.util.KsqlConfig;
 import io.confluent.ksql.util.PersistentQueryMetadata;
 import io.confluent.ksql.util.timestamp.TimestampExtractionPolicy;
@@ -64,6 +61,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import javax.ws.rs.core.Response;
+import org.apache.kafka.streams.StreamsConfig;
 import org.hamcrest.Description;
 import org.hamcrest.Matcher;
 import org.hamcrest.TypeSafeDiagnosingMatcher;
@@ -73,7 +71,11 @@ import org.junit.Test;
 
 public class RecoveryTest {
 
-  private final KsqlConfig ksqlConfig = KsqlConfigTestUtil.create("0.0.0.0");
+  private final KsqlConfig ksqlConfig = KsqlConfigTestUtil.create(
+      "0.0.0.0",
+      ImmutableMap.of(StreamsConfig.APPLICATION_SERVER_CONFIG, "http://localhost:23")
+  );
+
   private final List<QueuedCommand> commands = new LinkedList<>();
   private final FakeKafkaTopicClient topicClient = new FakeKafkaTopicClient();
   private final ServiceContext serviceContext = TestServiceContext.create(topicClient);
@@ -167,19 +169,16 @@ public class RecoveryTest {
       serverState = new ServerState();
       serverState.setReady();
       this.ksqlResource = new KsqlResource(
-          ksqlConfig,
           ksqlEngine,
           fakeCommandQueue,
           Duration.ofMillis(0),
           ()->{},
-          Injectors.DEFAULT,
           (sc, metastore, statement) -> {
-            return;
-          });
-      this.statementExecutor = new StatementExecutor(
-          ksqlConfig,
-          ksqlEngine,
-          new StatementParser(ksqlEngine));
+          }
+      );
+
+      this.statementExecutor = new StatementExecutor(ksqlEngine);
+
       this.commandRunner = new CommandRunner(
           statementExecutor,
           fakeCommandQueue,
@@ -187,6 +186,9 @@ public class RecoveryTest {
           mock(ClusterTerminator.class),
           serverState
       );
+
+      this.statementExecutor.configure(ksqlConfig);
+      this.ksqlResource.configure(ksqlConfig);
     }
 
     void recover() {
@@ -227,18 +229,18 @@ public class RecoveryTest {
   private static class TopicMatcher extends TypeSafeDiagnosingMatcher<KsqlTopic> {
 
     final Matcher<String> kafkaNameMatcher;
-    final Matcher<KsqlSerdeFactory> serDeMatcher;
+    final Matcher<ValueFormat> valueFormatMatcher;
 
     TopicMatcher(final KsqlTopic topic) {
       this.kafkaNameMatcher = equalTo(topic.getKafkaTopicName());
-      this.serDeMatcher = instanceOf(topic.getValueSerdeFactory().getClass());
+      this.valueFormatMatcher = equalTo(topic.getValueFormat());
     }
 
     @Override
     public void describeTo(final Description description) {
       description.appendList(
           "Topic(", ", ", ")",
-          Arrays.asList(kafkaNameMatcher, serDeMatcher));
+          Arrays.asList(kafkaNameMatcher, valueFormatMatcher));
     }
 
     @Override
@@ -251,8 +253,8 @@ public class RecoveryTest {
         return false;
       }
       return test(
-          serDeMatcher,
-          other.getValueSerdeFactory(),
+          valueFormatMatcher,
+          other.getValueFormat(),
           description,
           "serde mismatch: ");
     }

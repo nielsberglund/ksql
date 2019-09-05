@@ -16,10 +16,11 @@
 package io.confluent.ksql.function;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import io.confluent.ksql.schema.connect.SqlSchemaFormatter;
+import io.confluent.ksql.util.DecimalUtil;
 import io.confluent.ksql.util.KsqlException;
+import io.confluent.ksql.util.SchemaUtil;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
@@ -28,11 +29,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
-import java.util.function.BiPredicate;
 import java.util.stream.Collectors;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.kafka.connect.data.Schema;
-import org.apache.kafka.connect.data.Schema.Type;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -257,13 +256,6 @@ public class UdfIndex<T extends IndexedFunction> {
    */
   static final class Parameter {
 
-    private static final Map<Type, BiPredicate<Schema, Schema>> CUSTOM_SCHEMA_EQ =
-        ImmutableMap.<Type, BiPredicate<Schema, Schema>>builder()
-            .put(Type.MAP, Parameter::mapEquals)
-            .put(Type.ARRAY, Parameter::arrayEquals)
-            .put(Type.STRUCT, Parameter::structEquals)
-            .build();
-
     private final Schema schema;
     private final boolean isVararg;
 
@@ -309,15 +301,7 @@ public class UdfIndex<T extends IndexedFunction> {
         return reserveGenerics(schema, argument, reservedGenerics);
       }
 
-      final Schema.Type type = schema.type();
-
-      // we require a custom equals method that ignores certain values (e.g.
-      // whether or not the schema is optional, and the documentation)
-      return Objects.equals(type, argument.type())
-          && CUSTOM_SCHEMA_EQ.getOrDefault(type, (a, b) -> true).test(schema, argument)
-          && Objects.equals(schema.version(), argument.version())
-          && Objects.equals(schema.parameters(), argument.parameters())
-          && Objects.deepEquals(schema.defaultValue(), argument.defaultValue());
+      return SchemaUtil.areCompatible(schema, argument);
     }
     // CHECKSTYLE_RULES.ON: BooleanExpressionComplexity
 
@@ -354,6 +338,13 @@ public class UdfIndex<T extends IndexedFunction> {
       return structA.fields().isEmpty()
           || structB.fields().isEmpty()
           || Objects.equals(structA.fields(), structB.fields());
+    }
+
+    private static boolean bytesEquals(final Schema bytesA, final Schema bytesB) {
+      // from a UDF parameter perspective, all decimals are the same
+      // since they can all be cast to BigDecimal - other bytes types
+      // are not supported in UDFs
+      return DecimalUtil.isDecimal(bytesA) && DecimalUtil.isDecimal(bytesB);
     }
 
     @Override

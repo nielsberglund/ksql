@@ -34,7 +34,7 @@ import io.confluent.ksql.metastore.model.DataSource;
 import io.confluent.ksql.metastore.model.KsqlStream;
 import io.confluent.ksql.metastore.model.KsqlTable;
 import io.confluent.ksql.parser.KsqlParser.PreparedStatement;
-import io.confluent.ksql.parser.tree.QualifiedName;
+import io.confluent.ksql.execution.expression.tree.QualifiedName;
 import io.confluent.ksql.parser.tree.ShowColumns;
 import io.confluent.ksql.rest.entity.EntityQueryId;
 import io.confluent.ksql.rest.entity.KsqlEntity;
@@ -247,7 +247,8 @@ public class ListSourceExecutorTest {
         engine.getServiceContext().getKafkaClientSupplier(),
         engine.getServiceContext().getAdminClient(),
         spyTopicClient,
-        engine.getServiceContext().getSchemaRegistryClientFactory()
+        engine.getServiceContext().getSchemaRegistryClientFactory(),
+        engine.getServiceContext().getConnectClient()
     );
 
     // When:

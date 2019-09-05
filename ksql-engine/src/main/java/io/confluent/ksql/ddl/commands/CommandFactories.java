@@ -17,11 +17,13 @@ package io.confluent.ksql.ddl.commands;
 
 import static io.confluent.ksql.metastore.model.DataSource.DataSourceType;
 
+import io.confluent.ksql.parser.DropType;
 import io.confluent.ksql.parser.tree.CreateStream;
 import io.confluent.ksql.parser.tree.CreateTable;
 import io.confluent.ksql.parser.tree.DdlStatement;
 import io.confluent.ksql.parser.tree.DropStream;
 import io.confluent.ksql.parser.tree.DropTable;
+import io.confluent.ksql.parser.tree.RegisterType;
 import io.confluent.ksql.services.ServiceContext;
 import io.confluent.ksql.util.HandlerMaps;
 import io.confluent.ksql.util.HandlerMaps.ClassHandlerMapR2;
@@ -43,6 +45,8 @@ public class CommandFactories implements DdlCommandFactory {
       .put(CreateTable.class, CommandFactories::handleCreateTable)
       .put(DropStream.class, CommandFactories::handleDropStream)
       .put(DropTable.class, CommandFactories::handleDropTable)
+      .put(RegisterType.class, CommandFactories::handleRegisterType)
+      .put(DropType.class, CommandFactories::handleDropType)
       .build();
 
   private final ServiceContext serviceContext;
@@ -81,7 +85,7 @@ public class CommandFactories implements DdlCommandFactory {
         callInfo.sqlExpression,
         statement,
         callInfo.ksqlConfig,
-        serviceContext.getTopicClient());
+        serviceContext);
   }
 
   private CreateTableCommand handleCreateTable(
@@ -92,7 +96,7 @@ public class CommandFactories implements DdlCommandFactory {
         callInfo.sqlExpression,
         statement,
         callInfo.ksqlConfig,
-        serviceContext.getTopicClient());
+        serviceContext);
   }
 
   @SuppressWarnings("MethodMayBeStatic")
@@ -109,6 +113,15 @@ public class CommandFactories implements DdlCommandFactory {
         statement,
         DataSourceType.KTABLE
     );
+  }
+
+  @SuppressWarnings("MethodMayBeStatic")
+  private RegisterTypeCommand handleRegisterType(final RegisterType statement) {
+    return new RegisterTypeCommand(statement);
+  }
+
+  private DropTypeCommand handleDropType(final DropType statement) {
+    return new DropTypeCommand(statement.getTypeName());
   }
 
   private static final class CallInfo {

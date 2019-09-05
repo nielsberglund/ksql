@@ -15,9 +15,11 @@
 
 package io.confluent.ksql.function;
 
+import io.confluent.ksql.schema.ksql.types.SqlType;
 import java.util.List;
 import java.util.function.Supplier;
 import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.streams.kstream.Merger;
 
 
@@ -31,6 +33,8 @@ public interface KsqlAggregateFunction<V, A> extends IndexedFunction {
 
   Schema getReturnType();
 
+  SqlType returnType();
+
   boolean hasSameArgTypes(List<Schema> argTypeList);
 
   /**
@@ -42,7 +46,7 @@ public interface KsqlAggregateFunction<V, A> extends IndexedFunction {
   /**
    * Merges two session windows together with the same merge key.
    */
-  Merger<String, A> getMerger();
+  Merger<Struct, A> getMerger();
 
   String getDescription();
 

@@ -15,37 +15,37 @@
 
 package io.confluent.ksql.codegen;
 
+import io.confluent.ksql.execution.expression.tree.ArithmeticBinaryExpression;
+import io.confluent.ksql.execution.expression.tree.ArithmeticUnaryExpression;
+import io.confluent.ksql.execution.expression.tree.BetweenPredicate;
+import io.confluent.ksql.execution.expression.tree.Cast;
+import io.confluent.ksql.execution.expression.tree.ComparisonExpression;
+import io.confluent.ksql.execution.expression.tree.DereferenceExpression;
+import io.confluent.ksql.execution.expression.tree.Expression;
+import io.confluent.ksql.execution.expression.tree.FunctionCall;
+import io.confluent.ksql.execution.expression.tree.IsNotNullPredicate;
+import io.confluent.ksql.execution.expression.tree.IsNullPredicate;
+import io.confluent.ksql.execution.expression.tree.LikePredicate;
+import io.confluent.ksql.execution.expression.tree.LogicalBinaryExpression;
+import io.confluent.ksql.execution.expression.tree.NotExpression;
+import io.confluent.ksql.execution.expression.tree.QualifiedNameReference;
+import io.confluent.ksql.execution.expression.tree.SearchedCaseExpression;
+import io.confluent.ksql.execution.expression.tree.SubscriptExpression;
+import io.confluent.ksql.execution.expression.tree.VisitParentExpressionVisitor;
 import io.confluent.ksql.function.FunctionRegistry;
 import io.confluent.ksql.function.KsqlFunction;
 import io.confluent.ksql.function.UdfFactory;
 import io.confluent.ksql.function.udf.Kudf;
-import io.confluent.ksql.parser.tree.ArithmeticBinaryExpression;
-import io.confluent.ksql.parser.tree.ArithmeticUnaryExpression;
-import io.confluent.ksql.parser.tree.AstVisitor;
-import io.confluent.ksql.parser.tree.BetweenPredicate;
-import io.confluent.ksql.parser.tree.Cast;
-import io.confluent.ksql.parser.tree.ComparisonExpression;
-import io.confluent.ksql.parser.tree.DereferenceExpression;
-import io.confluent.ksql.parser.tree.Expression;
-import io.confluent.ksql.parser.tree.FunctionCall;
-import io.confluent.ksql.parser.tree.IsNotNullPredicate;
-import io.confluent.ksql.parser.tree.IsNullPredicate;
-import io.confluent.ksql.parser.tree.LikePredicate;
-import io.confluent.ksql.parser.tree.LogicalBinaryExpression;
-import io.confluent.ksql.parser.tree.NotExpression;
-import io.confluent.ksql.parser.tree.QualifiedNameReference;
-import io.confluent.ksql.parser.tree.SearchedCaseExpression;
-import io.confluent.ksql.parser.tree.SubscriptExpression;
 import io.confluent.ksql.schema.ksql.Field;
 import io.confluent.ksql.schema.ksql.LogicalSchema;
 import io.confluent.ksql.schema.ksql.SchemaConverters;
 import io.confluent.ksql.schema.ksql.SchemaConverters.SqlToJavaTypeConverter;
+import io.confluent.ksql.schema.ksql.types.SqlType;
 import io.confluent.ksql.util.ExpressionMetadata;
 import io.confluent.ksql.util.ExpressionTypeManager;
 import io.confluent.ksql.util.GenericRowValueTypeEnforcer;
 import io.confluent.ksql.util.KsqlConfig;
 import io.confluent.ksql.util.KsqlException;
-import io.confluent.ksql.util.SchemaUtil;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -60,6 +60,9 @@ import org.codehaus.commons.compiler.CompilerFactoryFactory;
 import org.codehaus.commons.compiler.IExpressionEvaluator;
 
 public class CodeGenRunner {
+
+  private static final SqlToJavaTypeConverter SQL_TO_JAVA_TYPE_CONVERTER =
+      SchemaConverters.sqlToJavaConverter();
 
   private final LogicalSchema schema;
   private final FunctionRegistry functionRegistry;
@@ -127,9 +130,10 @@ public class CodeGenRunner {
       ee.setDefaultImports(SqlToJavaVisitor.JAVA_IMPORTS.toArray(new String[0]));
       ee.setParameters(parameterNames, parameterTypes);
 
-      final Schema expressionType = expressionTypeManager.getExpressionSchema(expression);
+      final SqlType expressionType = expressionTypeManager
+          .getExpressionSqlType(expression);
 
-      ee.setExpressionType(SchemaUtil.getJavaType(expressionType));
+      ee.setExpressionType(SQL_TO_JAVA_TYPE_CONVERTER.toJavaType(expressionType));
 
       ee.cook(javaCode);
 
@@ -150,9 +154,7 @@ public class CodeGenRunner {
     }
   }
 
-  private static final class Visitor extends AstVisitor<Object, Object> {
-
-    private static final SqlToJavaTypeConverter converter = SchemaConverters.sqlToJavaConverter();
+  private static final class Visitor extends VisitParentExpressionVisitor<Object, Object> {
 
     private final LogicalSchema schema;
     private final Set<ParameterType> parameters;
@@ -177,7 +179,7 @@ public class CodeGenRunner {
 
     private void addParameter(final Field schemaField) {
       parameters.add(new ParameterType(
-          converter.toJavaType(schemaField.type().baseType()),
+          SQL_TO_JAVA_TYPE_CONVERTER.toJavaType(schemaField.type()),
           schemaField.fullName(),
           schemaField.fullName().replace(".", "_"),
           ksqlConfig));
@@ -188,6 +190,7 @@ public class CodeGenRunner {
       return null;
     }
 
+    @SuppressWarnings("deprecation") // Need to migrate away from Connect Schema use.
     public Object visitFunctionCall(final FunctionCall node, final Object context) {
       final int functionNumber = functionCounter++;
       final List<Schema> argumentTypes = new ArrayList<>();
